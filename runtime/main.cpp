@@ -1,18 +1,24 @@
-// ndskit runtime — ndsrun: a cartridge's recompiled programs on the runtime,
-// headless.
+// ndskit runtime — ndsrun: a cartridge's recompiled programs on the runtime.
 //
-//     ndsrun GAME.nds [--out DIR] [--vblanks N] [--save FILE] [--trace]
+//     ndsrun GAME.nds [--window] [--scale N] [--out DIR] [--vblanks N] [--save FILE]
+//                     [--shots V,V,...] [--shot-every N] [--input SCRIPT] [--trace]
 //                     [--ticks9 N] [--ticks7 N] [--no-dump] [--calls N]
 //                     [--break ADDR | --break7 ADDR] [--watch ADDR[:LEN]]
 //
-// Runs until N VBlanks have passed (or a fatal error), then writes the
-// memories to DIR (main.bin, itcm.bin, dtcm.bin, wram7.bin, swram.bin) and
-// the CPUs' registers (cpus.txt), for tools/compare against an oracle.
+// With --window, the game in a window, in real time, played with the
+// keyboard and the mouse. Otherwise headless: it runs until N VBlanks have
+// passed (or a fatal error), writes both screens as PNGs at the VBlanks
+// asked for (DIR/v<N>.png), then writes the memories to DIR (main.bin,
+// itcm.bin, dtcm.bin, wram7.bin, swram.bin) and the CPUs' registers
+// (cpus.txt), for comparisons with an oracle.
+#include "display.h"
 #include "nds.h"
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <sstream>
 
 int main(int argc, char** argv) {
     NdsConfig cfg;
@@ -31,6 +37,14 @@ int main(int argc, char** argv) {
         else if (a == "--no-dump") cfg.dump = false;
         else if (a == "--calls") cfg.calls = std::atoi(next().c_str());
         else if (a == "--input") cfg.input = next();
+        else if (a == "--window") cfg.window = true;
+        else if (a == "--scale") cfg.scale = std::atoi(next().c_str());
+        else if (a == "--shot-every") cfg.shot_every = std::strtoull(next().c_str(), nullptr, 0);
+        else if (a == "--shots") {
+            std::stringstream ss(next());
+            std::string v;
+            while (std::getline(ss, v, ',')) if (!v.empty()) cfg.shots.push_back(std::strtoull(v.c_str(), nullptr, 0));
+        }
         else if (a == "--watch") {                  // ADDR[:LEN], hex
             std::string w = next();
             size_t k = w.find(':');
@@ -46,10 +60,25 @@ int main(int argc, char** argv) {
         else { std::fprintf(stderr, "unknown argument %s\n", a.c_str()); return 2; }
     }
     if (cfg.rom.empty()) {
-        std::fprintf(stderr, "usage: ndsrun GAME.nds [--out DIR] [--vblanks N] [--save FILE] [--trace]\n");
+        std::fprintf(stderr, "usage: ndsrun GAME.nds [--window] [--out DIR] [--vblanks N] [--shots V,...]\n");
         return 2;
     }
     std::error_code ec;
     std::filesystem::create_directories(cfg.out, ec);
-    return nds_main(cfg);
+    if (!nds_boot(cfg)) return 2;
+    bool shots = !cfg.shots.empty() || cfg.shot_every;
+    if ((cfg.window || shots) && !display_open(cfg.window)) return 2;
+    auto shot_at = [&](uint64_t vbl) {
+        return shots && ((cfg.shot_every && vbl % cfg.shot_every == 0) ||
+                         std::find(cfg.shots.begin(), cfg.shots.end(), vbl) != cfg.shots.end());
+    };
+    for (;;) {
+        g_2d_on = cfg.window || shot_at(nds_vblanks() + 1);   // headless, the 2D engines draw only what a picture shows
+        if (!nds_run_frame()) break;
+        uint64_t vbl = nds_vblanks();
+        if (shot_at(vbl))
+            display_shot(cfg.out + "/v" + std::to_string(vbl) + ".png");
+        if (cfg.window && !display_frame()) break;
+    }
+    nds_finish();
 }

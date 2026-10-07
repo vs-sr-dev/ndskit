@@ -24,6 +24,10 @@ struct NdsConfig {
     std::string input;                  // buttons and taps by VBlank (input.cpp)
     int ticks9 = 16;                    // ticks a safe point stands for on the ARM9
     int ticks7 = 24;                    // ... and on the ARM7
+    bool window = false;                // a window, in real time, the keyboard and mouse as input
+    int scale = 0;                      // the 3D's resolution: 256x192 times this (0: from the window)
+    std::vector<uint64_t> shots;        // headless: both screens as PNGs at these VBlanks
+    uint64_t shot_every = 0;            // ... and every N VBlanks
 };
 extern NdsConfig g_cfg;
 
@@ -74,7 +78,9 @@ void nds_count_vblank();
 uint32_t nds_irq_marker(int cpu);       // the return address an interrupt pushes in the running thread
 void nds_irq_return(ArmContext& c);     // after the BIOS's return from an interrupt: maybe another thread
 void nds_cp15_boot();
-int  nds_main(const NdsConfig& cfg);    // runs until a stop; does not return
+bool nds_boot(const NdsConfig& cfg);    // the machine as the BIOS leaves it; false if it cannot start
+bool nds_run_frame();                   // runs to the next VBlank; false once stopped
+[[noreturn]] void nds_finish();         // the report, the memories, the save; exits
 
 // ---- the BIOS (bios.cpp) ----------------------------------------------------------------
 void bios_direct_boot();                // memory and registers as melonDS's direct boot leaves them
@@ -108,8 +114,65 @@ void video_dispstat_write(int cpu, uint16_t v);
 void vram_cnt_write(int bank, uint8_t v);               // VRAMCNT_A..I (0..8)
 uint8_t* vram_page(int cpu, uint32_t addr, int which);  // the banks under a VRAM address, nullptr past the last
 extern uint8_t g_palette[0x800], g_oam[0x800];
-void gx_write(uint32_t addr, uint32_t v, int size);     // the geometry engine's ports
+
+// VRAM as its users see it: areas of 16 KiB pages, each page up to four
+// banks' pages (where banks overlap a read ORs them).
+enum {
+    VRAM_BGA, VRAM_BGB, VRAM_OBJA, VRAM_OBJB, VRAM_LCDC, VRAM_ARM7, VRAM_TEX, VRAM_TEXPAL,
+    VRAM_BGEXTA, VRAM_BGEXTB, VRAM_OBJEXTA, VRAM_OBJEXTB,   // the extended palettes
+    VRAM_NAREAS
+};
+struct VramPage { uint8_t* p[4]; int n; };
+extern VramPage g_vram_map[VRAM_NAREAS][41];
+extern const int g_vram_pages[VRAM_NAREAS];
+static inline uint32_t vram_pg(int area, uint32_t off) {     // the page, the area repeated past its end
+    uint32_t pg = off >> 14, n = (uint32_t)g_vram_pages[area];
+    return pg < n ? pg : pg % n;
+}
+static inline uint16_t vram_r16(int area, uint32_t off) {
+    const VramPage& P = g_vram_map[area][vram_pg(area, off)];
+    uint32_t o = off & 0x3FFEu;
+    uint16_t v = 0, w;
+    for (int k = 0; k < P.n; ++k) { std::memcpy(&w, P.p[k] + o, 2); v |= w; }
+    return v;
+}
+static inline uint8_t vram_r8(int area, uint32_t off) {
+    const VramPage& P = g_vram_map[area][vram_pg(area, off)];
+    uint32_t o = off & 0x3FFFu;
+    uint8_t v = 0;
+    for (int k = 0; k < P.n; ++k) v |= P.p[k][o];
+    return v;
+}
+void vram_copy(int area, uint8_t* dst, uint32_t size);   // an area's first `size` bytes, as read
+
+// ---- the 2D engines (gpu2d.cpp) ----------------------------------------------------------
+// Each engine draws a line at a time as the line starts, into words the
+// compositor (display.cpp) turns into pixels with the 3D picture:
+//   word 0: the colour, RGB666 (r bits 0-5, g 6-11, b 12-17); bits 24-25 how
+//           it meets the 3D layer: 0 not at all, 1 the 3D is on top (bit 26:
+//           blended with this colour, the one under it, by the 3D's alpha),
+//           2 this colour is on top, blended with the 3D under it
+//   word 1: EVA (bits 0-4) and EVB (8-12) of a blend with the 3D; EVY (16-20)
+//           and the 3D's brightness effect (21-22: 2 up, 3 down); the master
+//           brightness (24-25: 1 up, 2 down; 26-30 its factor)
+struct Gpu2dFrame { uint32_t px[2][192][256][2]; };   // engine A, engine B
+extern Gpu2dFrame g_2d;
+void gpu2d_reset();
+void gpu2d_line(int y);                 // both engines draw line y (0-191)
+void gpu2d_vblank();
+void gpu2d_written(uint32_t off);       // a write to the ARM9's registers 0x000-0x06F or 0x1000-0x106F
+bool gpu2d_top_is_a();                  // POWCNT1 bit 15: engine A on the upper screen
+extern bool g_2d_on;                    // the engines draw (headless runs: only for a picture's frame)
+// the compositor in software: one pixel's words with the 3D's (RGB666 + alpha in bits 18-22)
+uint32_t gpu2d_compose(const uint32_t* w, uint32_t px3d);   // -> 0xRRGGBB
+
+// ---- the geometry engine (gx.cpp) -----------------------------------------------------
+void gx_reset();
+void gx_write(uint32_t addr, uint32_t v, int size);     // GXFIFO, the command ports, the 3D registers
 uint32_t gx_read(uint32_t addr, int size);
+void gx_vblank();                       // a SWAP_BUFFERS waiting: the lists go to the rendering engine
+void gx_render_start();                 // the rendering engine starts a frame: its job is taken (render3d.h)
+void gx_line();                         // the geometry FIFO's interrupt, as each line passes
 
 // ---- the cartridge (cart.cpp) ----------------------------------------------------------
 bool cart_open(const std::string& path);

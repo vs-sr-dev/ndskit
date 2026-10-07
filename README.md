@@ -21,7 +21,7 @@ knowledge. Game formats and game fixes live in the ports.
 
 | Port | Game | What it asked of ndskit |
 |---|---|---|
-| pc-moon | Moon (2009) | the cartridge (header, ModuleParams and autoloads of both CPUs, FNT/FAT, NitroROM images nested as archives), the address maps, the BIOS's LZ77, SDAT, the ARM/Thumb decoder, function discovery for CodeWarrior's ARM code (switches, veneers, hand-written dispatch, vtables of small methods, context saves) with the programs read where they run, an ARM interpreter, the recompiler to C++ and its self-test, the runtime's core (both CPUs in time, the SDK's threads as coroutines, interrupts, the BIOS, the I/O, timers, DMA, IPC, the cartridge and its backup memory, SPI, the RTC), melonDS savestates as the oracle |
+| pc-moon | Moon (2009) | the cartridge (header, ModuleParams and autoloads of both CPUs, FNT/FAT, NitroROM images nested as archives), the address maps, the BIOS's LZ77, SDAT, the ARM/Thumb decoder, function discovery for CodeWarrior's ARM code (switches, veneers, hand-written dispatch, vtables of small methods, context saves) with the programs read where they run, an ARM interpreter, the recompiler to C++ and its self-test, the runtime's core (both CPUs in time, the SDK's threads as coroutines, interrupts, the BIOS, the I/O, timers, DMA, IPC, the cartridge and its backup memory, SPI, the RTC), melonDS savestates as the oracle; the picture (the 2D engines in software, the geometry engine, an OpenGL renderer at any scale, a window with the keyboard and the mouse) |
 
 ## Using it
 
@@ -48,7 +48,9 @@ python -m ndskit.recomp GAME.nds --out build/recomp [--optest] [--copy 9:DEST=SR
 python -m ndskit.recomp.selftest GAME.nds --cpu 9 --auto --out arm9.txt        # vectors of the functions that run alone
 cmake -S build/recomp -B build/recomp/b -G Ninja -DCMAKE_CXX_COMPILER=clang++ && ninja -C build/recomp/b
 build/recomp/b/selftest build/recomp/selftest/*.txt arm9.txt                    # the recompiled code against them
+build/recomp/b/ndsrun GAME.nds --window [--scale 4]                              # the game in a window, in real time
 build/recomp/b/ndsrun GAME.nds --out build/run --vblanks 600 [--input 300:START,400:tap:128:96]   # the machine, headless
+build/recomp/b/ndsrun GAME.nds --out build/run --vblanks 600 --shots 300,600     # both screens as PNGs at those VBlanks
 build/recomp/b/ndsrun GAME.nds --vblanks 600 --break 0211860C --calls 200       # stop at a function, the last calls
 build/recomp/b/ndsrun GAME.nds --vblanks 600 --watch 022AA568:4                 # who stores there
 python -m ndskit.melonds STATE.ml1 --compare build/run                          # its memories against melonDS's
@@ -62,13 +64,13 @@ python -m ndskit.melonds STATE.ml1 --compare build/run                          
 | 2. Extract | Turn standard formats into standard files | `rom --extract` (files, `sys/` with header, programs, overlays and banner; NitroROM images inside, `--nested`; the SDK's backward LZ undone), `lz` (LZ10, LZ11, RLE), `sdat` (every record, files named by their symbols) | G2D (NCLR/NCGR/NSCR/NCER/NANR) to images, NSBMD/NSBTX, SWAV/STRM to WAV, NARC, NFTR |
 | 3. Map code | What does the code do, where? | `arm` (ARMv5TE and Thumb decoder, disassembly with literals resolved and registers named, `--refs`, `--census`), `hw` (both CPUs' address maps and register names), `armemu` (an interpreter for both CPUs: the recompiler's reference, and a way to run one of the game's functions), `ghidra/ExportFuncs.java` | SDK names by signature |
 | 4. Translate | Turn ARM code into C++ | `recomp.discover` (recursive descent over ARM and Thumb with the mode carried through interworking; the program read in segments where it runs, its autoloads included; constants through straight lines for veneers and calls through registers; CodeWarrior's `addls pc` switches; hand-written jumps through tables of offsets, followed through registers; returns set up in lr; pointer, boundary and prologue seeds to a fixed point; what each write to pc is), `recomp.emit` and `python -m ndskit.recomp` (one C++ function per entry, one module per program: conditions, flags stored only where read, the PC as a value, calls through registers dispatched by address and mode, switches, interworking, modes, exception returns), `recomp.selftest` (vectors from the interpreter: every instruction form, the game's functions that run alone) | Thumb switches, halfword-offset tables |
-| 5. Runtime | Replace the hardware | `runtime/` (C++20): the CPU context, the memories, the modes, the dispatch, the self-test; the machine (`ndsrun`): both CPUs in quanta of virtual time, each guest thread on its own coroutine (the SDK's context switches followed), interrupts as the BIOS takes them, the BIOS's SWIs, a direct boot as melonDS does it, the I/O of both CPUs, VRAM through its banks, timers, DMA, IPC, the maths unit, the cartridge's commands and its backup memory, SPI (power, firmware, touch), the RTC, the sound registers; a call trace, breaks and a store watch. `melonds`: savestates read, memories compared | the 2D engines; the geometry engine and an OpenGL renderer at any resolution; the sound channels; SDL3, a window, the keyboard and the mouse |
+| 5. Runtime | Replace the hardware | `runtime/` (C++20): the CPU context, the memories, the modes, the dispatch, the self-test; the machine (`ndsrun`): both CPUs in quanta of virtual time, each guest thread on its own coroutine (the SDK's context switches followed), interrupts as the BIOS takes them, the BIOS's SWIs, a direct boot as melonDS does it, the I/O of both CPUs, VRAM through its banks, timers, DMA, IPC, the maths unit, the cartridge's commands and its backup memory, SPI (power, firmware, touch), the RTC, the sound registers; a call trace, breaks and a store watch; the 2D engines in software a line at a time, the geometry engine in the DS's fixed point, the rendering engine on OpenGL 4.5 at any scale (the texture memory read in the shader), a compositor, a window (SDL3) with the keyboard and the mouse, headless pictures. `melonds`: savestates read, memories compared | the sound channels and the mixer; the 3D's anti-aliasing, edge marking, shadow polygons; display capture |
 
 ## Principles
 
 * Pure Python, no dependencies, for layers 1–4; the runtime (layer 5)
-  is C++20, built with CMake, Ninja and clang, and will add SDL3 and
-  OpenGL 4.5, as in wiikit and saturnkit.
+  is C++20, built with CMake, Ninja and clang, with SDL3 and OpenGL
+  4.5, as in wiikit and saturnkit.
 * Every claim is checked on a real cartridge before it goes in.
 * Game knowledge stays out.
 * Every change is checked on every port before it goes in.
@@ -87,6 +89,7 @@ python -m ndskit.melonds STATE.ml1 --compare build/run                          
 | `armemu` | against Unicorn's ARM946 (QEMU), a scratch script: 12 993 random ARM instructions, 12 490 Thumb ones and 1 960 branches, calls and loads into pc, every register, flag and byte of memory compared: no difference, outside unaligned accesses (QEMU does them as an ARMv6; the DS's CPUs rotate or align, as armemu does, after melonDS) and what the architecture leaves open. The SDK's divisions in Moon on known answers |
 | `recomp` (emit, selftest, runtime) | Moon's ARM9 (5 413 functions, 305 574 instructions) and ARM7 (933, 37 664) compile with clang 22 and link; the instruction test of both CPUs (7 292 functions, 57 749 vectors) and 1 512 of Moon's functions that run alone (23 806 vectors) give the same registers, flags and memory as armemu: 81 555 vectors, no difference. A wrong carry planted in the emitter gives 91 failures |
 | `runtime` (the machine), `melonds` | Moon boots, plays its movies, reads its files and its save, and with a script of 11 presses goes through its menus into its first room, deterministically (two runs, the same memories). Against melonDS at the same frame of the SDK's VBlank count: after 464 frames with no input and the same save, 74 bytes of main RAM differ (counters that follow time, the RTC's date), the ITCM and the shared WRAM not at all; after the same presses, 3 642 frames, in the same room with the camera's same orientation |
+| `runtime` (the picture, session 5) | Moon's logos, movies, menus, title and first room (1 103 polygons a frame, fog) against melonDS's pictures at the same frames: the title's 3D within 496 of 38 400 pixels, the menu's lower screen identical but for a pulsing border, the first room apart at polygon edges (anti-aliasing) and where the player stands; in a window in real time |
 | `recomp.discover` (session 4) | Moon's ARM9: all 4 680 of Ghidra's functions covered (6 580 functions, 166 switches); every entry of session 3 kept. 0 conflicts on the three cartridges, each with more functions found (a 2010 one 2 214 to 2 319, a 2008 one 3 090 to 3 201) |
 
 ## Known gaps
@@ -103,9 +106,11 @@ python -m ndskit.melonds STATE.ml1 --compare build/run                          
   nor returns go to `arm_jump` at run time (an entry is called, anything
   else is taken for a return); a C++ exception's landing (a jump into a
   catch block up the stack) is not unwound to yet.
-* `runtime`: no picture and no sound yet (the 2D engines, the geometry
-  engine and the mixer are the next phases: GXFIFO takes everything and
-  GXSTAT reads idle); time is a fixed cost per safe point, not cycles;
+* `runtime`: no sound yet (the mixer is the next phase); the 3D's
+  anti-aliasing, edge marking, shadow polygons, the translucent polygon
+  ID rule, the equal depth test, the clear image and 1-dot polygons are
+  not drawn, nor are display capture, mosaic and main memory display;
+  time is a fixed cost per safe point, not cycles;
   the shared WRAM stays the ARM7's (WRAMCNT = 3); the BIOS's sound tables
   are worked out from their definitions, not read; the backup memory is
   an EEPROM of the save file's size (64 Kbit by default) or a flash chip;

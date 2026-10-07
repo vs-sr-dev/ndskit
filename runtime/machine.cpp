@@ -523,6 +523,9 @@ static void dump() {
     write_file(g_cfg.out + "/dtcm.bin", g_dtcm, 0x4000);
     write_file(g_cfg.out + "/wram7.bin", g_wram7, 0x10000);
     write_file(g_cfg.out + "/swram.bin", g_swram, 0x8000);
+    std::vector<uint16_t> io(0x1000);
+    for (uint32_t i = 0; i < 0x1000; ++i) io[i] = io_reg16(9, 0x04000000u + 2 * i);
+    write_file(g_cfg.out + "/io9.bin", io.data(), 0x2000);
     FILE* f = std::fopen((g_cfg.out + "/cpus.txt").c_str(), "w");
     if (f) {
         for (int cpu : {9, 7}) {
@@ -547,12 +550,12 @@ static const ArmModule* find_module(int cpu) {
     return nullptr;
 }
 
-int nds_main(const NdsConfig& cfg) {
+bool nds_boot(const NdsConfig& cfg) {
     g_cfg = cfg;
     g_arm_trace = cfg.calls > 0 || cfg.break_at;
     g_watch_lo = cfg.watch_lo;
     g_watch_len = cfg.watch_len;
-    if (!cart_open(cfg.rom)) { std::fprintf(stderr, "cannot open %s\n", cfg.rom.c_str()); return 2; }
+    if (!cart_open(cfg.rom)) { std::fprintf(stderr, "cannot open %s\n", cfg.rom.c_str()); return false; }
     for (int cpu : {9, 7}) {
         NdsCpu& p = nds_cpu(cpu);
         std::memset(&p, 0, sizeof p);
@@ -575,22 +578,31 @@ int nds_main(const NdsConfig& cfg) {
     g_main_co = coro_main();
     for (int cpu : {9, 7}) {
         const ArmModule* m = find_module(cpu);
-        if (!m) { std::fprintf(stderr, "no module of this build matches the ARM%d program\n", cpu); return 2; }
+        if (!m) { std::fprintf(stderr, "no module of this build matches the ARM%d program\n", cpu); return false; }
         arm_activate(m);
         nds_note("ARM%d: module %s, entry %08X", cpu, m->name, cpu == 9 ? entry9 : entry7);
         g_cur[ci(cpu)] = new_thread(cpu, cpu == 9 ? entry9 : entry7);
     }
-    while (!g_stop) {
+    return true;
+}
+
+bool nds_run_frame() {
+    uint64_t vbl = g_vblanks;
+    while (!g_stop && g_vblanks == vbl) {
         g_qend = std::min(next_event(), g_now + kQuantum);
         run_cpu(9);
         run_cpu(7);
         g_now = g_qend;
         fire_events();
-        if (cfg.stop_vblanks && g_vblanks >= cfg.stop_vblanks) nds_stop("VBlank limit");
+        if (g_cfg.stop_vblanks && g_vblanks >= g_cfg.stop_vblanks) nds_stop("VBlank limit");
     }
-    nds_note("stopped: %s", g_stop);
+    return g_vblanks != vbl;
+}
+
+void nds_finish() {
+    nds_note("stopped: %s", g_stop ? g_stop : "by the host");
     report();
-    if (cfg.dump) dump();
+    if (g_cfg.dump) dump();
     cart_save();
     std::fflush(stderr);
     std::fflush(stdout);

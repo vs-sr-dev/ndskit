@@ -125,6 +125,10 @@ static void w16(int cpu, uint32_t a, uint16_t v, uint16_t mask) {
         if (off >= 0x320 && off < 0x6A4) { gx_write(a, m, 2); return; }
     }
     io_set16(cpu, a, m);
+    if (cpu == 9 && (off & ~0x1000u) < 0x70) {
+        if (off == 0x066 && (m & 0x8000)) nds_once("2d", 4, "2D: display capture is not done");
+        gpu2d_written(off);
+    }
 }
 
 static uint32_t io_read(int cpu, uint32_t a, int size) {
