@@ -10,7 +10,10 @@ every game, independent of any particular title:
     lz       the BIOS's compressions: LZ77 (LZ10), LZ11, RLE
     sdat     NitroSDK sound archives: sequences, banks, wave archives, streams, players
     arm      ARM and Thumb (ARMv5TE / ARMv4T) decoding, disassembly, literal cross-references
-    recomp   layer 4: discover (functions in programs without symbols, read where they run)
+    armemu   an ARM interpreter for both CPUs: the recompiler's reference
+    recomp   layer 4: discover (functions in programs without symbols, read where they run),
+             emit and __main__ (ARM and Thumb to C++, one module per program), selftest
+    runtime/ layer 5, C++20: the CPU context, memory, modes, dispatch, the self-test
     ghidra/  ExportFuncs.java: Ghidra's functions, for cross-checking discovery
 
 Layers 1-4 are pure Python 3.8+ with no dependencies. Game-specific knowledge

@@ -20,50 +20,76 @@ output (the compiler of NitroSDK games) and the SDK's hand-written parts:
    both ways, `b`, switch tables, fall-through, conditional instructions
    (including conditional returns) running on. A `b` to another
    function's entry is a tail call and is not followed. Returns: `bx lr`,
-   `mov pc, lr`, `pop`/`ldm` with pc.
+   `mov pc, lr`, `pop`/`ldm` with pc. An address the function puts in lr
+   itself (`mov lr, pc`, `add lr, pc, #n`) is walked too: code that runs
+   when a local subroutine returns there.
 4. Constants are propagated through a straight line of code (`ldr` from
-   the literal pool, `mov`/`mvn` of an immediate, `add`/`sub` from pc,
-   register copies; a call clobbers r0-r3, r12 and lr). They resolve
-   `bx rN`, `blx rN` and `mov pc, rN` whose rN holds a known address:
-   CodeWarrior's long-branch veneers (`ldr r12, [pc]; bx r12`) and calls
-   through a register. `mov lr, pc` (or `add lr, pc, #n`) before a jump
-   through a register, or an address put in lr earlier in the same
-   straight line (`sub lr, pc, #n` at a dispatch loop's head), makes it a
-   call: execution resumes at lr's value. Two conditional transfers in a
-   row with opposite conditions on the same flags (`bxpl r12` then
-   `popmi {..., pc}`) end the block: nothing runs after them.
+   the literal pool, `mov`/`mvn` of an immediate, `add`/`sub` from pc or
+   of an immediate to a constant, `mov rd, pc`, register copies; a call
+   clobbers r0-r3, r12 and lr). They resolve `bx rN`, `blx rN` and `mov
+   pc, rN` whose rN holds a known address: CodeWarrior's long-branch
+   veneers (`ldr r12, [pc]; bx r12`), Thumb's `bx pc` into the ARM code
+   that follows, calls through a register, targets built in two steps
+   (`add r4, pc, #k; add r4, r4, #0x2600; movle pc, r4`). `mov lr, pc`
+   (or `add lr, pc, #n`) before a jump through a register, or an address
+   put in lr earlier in the same straight line (`sub lr, pc, #n` at a
+   dispatch loop's head), makes it a call: execution resumes at lr's
+   value. Two conditional transfers in a row with opposite conditions on
+   the same flags (`bxpl r12` then `popmi {..., pc}`) end the block:
+   nothing runs after them. That holds on a straight line only: when the
+   walk applied it across an address that something also jumps to (a
+   join, reached with other flags), the function is walked again without
+   it from there.
 5. Literal loads mark their bytes as data.
 6. Switches. CodeWarrior's ARM switch: `cmp rI, #N` ... `addls pc, pc,
    rI, lsl #2`, then the default's `b` and N + 1 entries, each one
-   instruction (a `b` to the case) walked as code. The jump through a
-   table of offsets relative to the table (hand-written code: `sub rT,
-   pc, #k` or `add rT, pc, #k`; `ldr rX, [rT, rI, lsl #2]`; `add pc, rX,
-   rT`): entries are read while each lands on code inside the segment,
-   after the table; with lr set first (`add lr, pc, #n`) it is a call.
+   instruction (a `b` to the case) walked as code; the bound is found
+   back through the straight line, conditional branches out of it
+   included, and through `subs rI, rX, #k` after `cmp rX, #N` (a range of
+   cases from k, `addpl`). With no bound, a table of branches is read
+   while its entries are branches, and an unconditional `add pc, pc, rI,
+   lsl #2` into code that is not a table (the SDK's unrolled division)
+   takes every instruction of the run it lands in. Tables of offsets from
+   their own address (hand-written code): `ldr rX, [rT, rI{, lsl #2}]`
+   with rT a constant, then `add pc, rT, rX`, or `add rY, rT, rX` ...
+   `mov pc, rY` (`bx rY`), the registers followed through the straight
+   line; entries are read while each lands on an instruction outside the
+   table, before or after it; with lr set first (`add lr, pc, #n`) it is a
+   call.
 7. Unreached code: after the pass, a word in the data that points into a
    segment is a function reached by pointer (a callback, a handler, a
    virtual method) if its descent meets no undefined instruction and no
-   data, and it either opens with a stack-frame prologue (`push {..., lr}`
-   or `stmdb sp!`), is loaded by the code as a literal, or sits in a run of
-   at least two such pointers (a table). Failing that, unclassified words
-   right after a function's end or a literal pool that open with a
-   prologue are taken the same way (the linker places whole object files,
-   so uncalled functions sit between called ones). Repeat to a fixed point.
+   data, its first instruction has no condition, and it either opens with
+   a stack-frame prologue (`push {..., lr}` or `stmdb sp!`), is loaded by
+   the code as a literal, or sits in a run of at least two such pointers
+   (a table) -- four instructions at least, unless it is both loaded as a
+   literal and placed after data or a function's end (an empty callback
+   is a lone `bx lr`). Failing that, unclassified words right after a
+   function's end or a literal pool that open with a prologue are taken
+   the same way (the linker places whole object files, so uncalled
+   functions sit between called ones). Repeat to a fixed point.
 
 `Program` keeps: funcs {entry: Function}, code {address: size}, data
 (byte addresses), switches {jump address: [targets]}, the calls and jumps
 through registers it could not resolve, and the descents that met data or
-an undefined instruction (conflicts).
+an undefined instruction (conflicts). Each Function keeps, for every
+instruction that writes pc from a value, what the walk took it for
+(`sites`: a return, a call with its return address, a switch, a jump with
+its target when known): the recompiler (recomp.emit) works from them.
 
 Checked on Moon's ARM9 against Ghidra 12's auto-analysis (ndskit/ghidra):
-of Ghidra's 4 680 functions, 4 646 found as entries and 17 inside another
+of Ghidra's 4 680 functions, 4 648 found as entries and 15 inside another
 function's code (entries a few bytes apart, shared tails), 17 not reached
 (15 of them hand-written decoder routines reached through tables of
-offsets whose base is in a register set elsewhere); 749 more found that
-Ghidra has not. Its ARM7: 535 of Ghidra's 536 (the program read where its
-autoloads run), 390 more. No conflict on Moon or two other cartridges.
-Known gap: CodeWarrior's Thumb switches are not recognised yet (a
-Thumb-heavy 2008 cartridge leaves half its ARM9 unclassified).
+offsets whose base is in a register set elsewhere); 765 more found that
+Ghidra has not. Its ARM7: 535 of Ghidra's 536 (the
+program read where its autoloads run). No conflict on Moon or two other
+cartridges.
+Known gaps: CodeWarrior's Thumb switches (`add pc, rI` after a `lsl`;
+a Thumb-heavy 2008 cartridge leaves half its ARM9 unclassified), and the
+switches through tables of halfword offsets in a newer SDK's ARM7 (`cmp
+rI, #N; bhi default; add rI, pc, rI, lsl #1; ldrh rI, [rI, #4]; add pc,
+pc, rI`).
 """
 import argparse
 import bisect
@@ -130,7 +156,7 @@ class Memory:
 
 
 class Function:
-    __slots__ = ("entry", "thumb", "code", "calls", "tails", "conflicts", "unresolved", "size")
+    __slots__ = ("entry", "thumb", "code", "calls", "tails", "conflicts", "unresolved", "size", "sites")
 
     def __init__(self, entry, thumb):
         self.entry, self.thumb = entry, thumb
@@ -140,12 +166,18 @@ class Function:
         self.conflicts = []        # (address, why)
         self.unresolved = []       # (address, text)
         self.size = 0
+        # what each instruction that writes pc from a value was taken for:
+        # address -> (kind, target, return address); kind "return", "call", "jump"
+        # or "switch" (its targets in Program.switches); target: the address with
+        # bit 0 for Thumb, or None when unknown; return address: where lr points
+        # (a call, or a switch that is one), else None
+        self.sites = {}
 
 
 def _is_prologue(ins, mem=None):
     """push {..., lr}; or, given mem, a variadic function's push {r0-r3} before one."""
     if ins is None or ins.op != "stm" or ins.rn != 13 or not ins.writeback or ins.mode != "db" \
-            or not ins.reglist:
+            or not ins.reglist or ins.cond != 14:
         return False
     if ins.reglist & 0x4000:
         return True
@@ -185,32 +217,70 @@ class Program:
 
     # ---- one function -------------------------------------------------
     def _consts_step(self, regs, ins):
-        """Update the straight-line constants after ins; regs is a dict."""
-        val = None
+        """Update the straight-line constants after ins; regs is a dict: a
+        register's number for a known value, ("w", r) for a word read from the
+        table at that address, ("o", r) for that table's address plus such a
+        word (a target taken from a table of offsets)."""
+        val = sym = None
+        plain = ins.cond == 14 and ins.shift is None and ins.rs is None
         if ins.op == "ldr" and ins.rn == 15 and ins.target is not None and ins.cond == 14:
             val = self.mem.u32(ins.target)
         elif ins.op in ("mov", "mvn") and ins.imm is not None and ins.rm is None and ins.cond == 14:
             val = ins.imm & 0xFFFFFFFF if ins.op == "mov" else ~ins.imm & 0xFFFFFFFF
         elif ins.op in ("add", "sub") and ins.rn == 15 and ins.target is not None and ins.cond == 14:
             val = ins.target
-        elif ins.op == "mov" and ins.rm is not None and ins.imm is None and ins.shift_imm == 0 \
-                and ins.rs is None and ins.cond == 14 and ins.rm in regs:
-            val = regs[ins.rm]
+        elif ins.op in ("add", "sub") and ins.imm is not None and ins.rn in regs and ins.cond == 14:
+            val = (regs[ins.rn] + (ins.imm if ins.op == "add" else -ins.imm)) & 0xFFFFFFFF
+        elif ins.op == "mov" and ins.rm is not None and ins.imm is None and plain:
+            if ins.rm == 15:
+                val = ins.pc + (4 if ins.thumb else 8)
+            elif ins.rm in regs:
+                val = regs[ins.rm]
+            elif ("o", ins.rm) in regs:
+                sym = ("o", regs[("o", ins.rm)])
+        elif ins.op == "ldr" and ins.rm is not None and ins.pre and ins.add and not ins.writeback \
+                and ins.cond == 14 and ins.shift in (None, "lsl") and ins.shift_imm in (0, 2) \
+                and ins.rn in regs:
+            sym = ("w", regs[ins.rn])
+        elif ins.op == "add" and ins.rm is not None and ins.imm is None and plain and not ins.s:
+            for a, b in ((ins.rn, ins.rm), (ins.rm, ins.rn)):
+                if a in regs and regs.get(("w", b)) == regs[a]:
+                    sym = ("o", regs[a])
         for r in _clobbers(ins):
             regs.pop(r, None)
-        if val is not None and ins.rd is not None:
-            regs[ins.rd] = val
+            regs.pop(("w", r), None)
+            regs.pop(("o", r), None)
+        if ins.rd is not None:
+            if val is not None:
+                regs[ins.rd] = val
+            elif sym is not None:
+                regs[(sym[0], ins.rd)] = sym[1]
 
     def _walk(self, f, commit):
-        """Descend one function: its code, calls, tail calls, conflicts, unresolved jumps."""
+        """Descend one function: its code, calls, tail calls, conflicts, unresolved
+        jumps. The rule of opposite conditions holds on a straight line only: where
+        it ended a block across an address that something also jumps to (a join, met
+        with other flags), the descent is done again without it there."""
+        joins = set()
+        while True:
+            f.__init__(f.entry, f.thumb)
+            bad = self._walk_once(f, commit, joins)
+            if bad <= joins:
+                return f
+            joins |= bad
+
+    def _walk_once(self, f, commit, joins):
+        """One descent; returns the joins the rule of opposite conditions was applied across."""
         thumb = f.thumb
         mem = self.mem
         todo = [(f.entry, {})]
         seen = set()
+        targets, ruled = {f.entry}, []
         while todo:
             pc, regs = todo.pop()
             regs = dict(regs)
             ended = None    # condition of the last conditional transfer, while the flags hold
+            since = []      # the addresses passed since it
             while True:
                 if pc in seen:
                     break
@@ -238,15 +308,27 @@ class Program:
                         if v is not None:
                             self.literal_loaded.add(v)
                 src = regs.get(ins.rm) if ins.rm is not None else None
+                if ins.rm == 15 and ins.op in ("bx", "blx"):
+                    src = ins.pc + (4 if thumb else 8)      # bx pc: Thumb's veneer into ARM
                 lr_before = regs.get(14)
                 self._consts_step(regs, ins)
+                if ins.rd == 14 and not thumb and ins.cond == 14 and 14 in regs and (
+                        ins.op == "mov" and ins.rm == 15 or ins.op in ("add", "sub") and ins.rn == 15):
+                    todo.append((regs[14], {}))     # a return address of its own: code that
+                    targets.add(regs[14])           # runs when a local subroutine returns
                 nxt = pc + ins.size
                 op, cond = ins.op, ins.cond
                 # a conditional transfer falls through, unless the one before it had
                 # the opposite condition on the same flags (bxpl ...; popmi {..., pc})
-                go_on = cond != 14 and not (ended is not None and cond == ended ^ 1)
-                if ins.s or op in arm.COMPARES:
+                if pc in joins:     # met by another path too: its flags are not this path's
                     ended = None
+                if ended is not None:
+                    since.append(pc)
+                go_on = cond != 14 and not (ended is not None and cond == ended ^ 1)
+                if cond != 14 and not go_on:
+                    ruled.append(list(since))
+                if ins.s or op in arm.COMPARES:
+                    ended, since = None, []
                 if op in ("bl", "blx") and ins.target is not None:
                     f.calls.add((ins.target, ins.exchange == "thumb" if ins.exchange else thumb))
                     pc = nxt
@@ -256,9 +338,11 @@ class Program:
                         f.calls.add((src & ~1, bool(src & 1)))
                     else:
                         f.unresolved.append((pc, "call " + ins.text))
+                    f.sites[pc] = ("call", src, nxt | thumb)
                     pc = nxt
                     continue
                 if op == "b":
+                    targets.add(ins.target)
                     if not go_on:
                         if self.entries.get(ins.target) == thumb and ins.target != f.entry:
                             f.tails.add((ins.target, thumb))
@@ -266,7 +350,7 @@ class Program:
                         pc = ins.target
                         continue
                     todo.append((ins.target, regs))
-                    ended = cond
+                    ended, since = cond, []
                     pc = nxt
                     continue
                 if not ins.writes_pc:
@@ -275,14 +359,18 @@ class Program:
                 # everything else that writes pc
                 if op == "bx" and ins.rm == 14 or op == "mov" and ins.rm == 14 and ins.imm is None \
                         or op == "ldm" or op == "ldr" and ins.rn == 13 and ins.writeback:
+                    f.sites[pc] = ("return", None, None)
                     if go_on:                   # a conditional return
-                        ended = cond
+                        ended, since = cond, []
                         pc = nxt
                         continue
                     break
                 sw = self._switch(f, ins, regs, commit)
                 if sw is not None:
+                    lr = self._lr_set(pc, thumb)
+                    f.sites[pc] = ("switch", None, None if lr is None else lr | thumb)
                     todo.extend((t, {}) for t in sw)
+                    targets.update(sw)
                     if go_on:
                         pc = nxt
                         continue
@@ -297,25 +385,27 @@ class Program:
                 if lr is None and lr_before is not None and mem.inside(lr_before & ~1):
                     lr = lr_before          # lr set further back in the straight line
                 kind = "call " if lr is not None else "jump "
+                f.sites[pc] = (kind.strip(), target, lr)
                 if target is not None:
                     (f.calls if lr is not None else f.tails).add((target & ~1, bool(target & 1)))
                 else:
                     f.unresolved.append((pc, kind + ins.text))
                 if lr is not None:
-                    if lr != nxt:
-                        todo.append((lr, {}))
+                    if lr & ~1 != nxt:
+                        todo.append((lr & ~1, {}))
+                        targets.add(lr & ~1)
                         if not go_on:
                             break
-                        ended = cond
+                        ended, since = cond, []
                     pc = nxt
                     continue
                 if go_on:
-                    ended = cond
+                    ended, since = cond, []
                     pc = nxt
                     continue
                 break
         f.size = sum(mem.insn(a, thumb).size for a in f.code)
-        return f
+        return {a for path in ruled for a in path if a in targets}
 
     def _lr_set(self, pc, thumb):
         """If the instruction before pc set lr to a return address (mov lr, pc /
@@ -332,66 +422,110 @@ class Program:
     def _switch(self, f, ins, regs, commit):
         """Targets of a recognised computed jump, or None."""
         mem, thumb = self.mem, f.thumb
+        if thumb or ins.rm is None or ins.rs is not None or ins.imm is not None:
+            return None
         # CodeWarrior: [cmp rI, #N] addls pc, pc, rI, lsl #2 ; b default ; N+1 entries
-        if not thumb and ins.op == "add" and ins.rd == 15 and ins.rn == 15 and ins.rm is not None \
-                and ins.shift == "lsl" and ins.shift_imm == 2 and ins.rs is None:
-            n = self._bound(ins.pc, ins.rm, thumb)
-            if n is None:
-                return None
+        if ins.op == "add" and ins.rd == 15 and ins.rn == 15 and ins.shift == "lsl" and ins.shift_imm == 2:
             first = ins.pc + 8
-            targets = [ins.pc + 4] + [first + 4 * k for k in range(n + 1)]
+            n = self._bound(ins.pc, ins.rm, thumb)
+            if n is not None:
+                targets = [first + 4 * k for k in range(n + 1)]
+            elif mem.insn(first, False) is not None and mem.insn(first, False).op == "b":
+                targets = []            # no bound found: the table's branches
+                while len(targets) < 256:
+                    t = mem.insn(first + 4 * len(targets), False)
+                    if t is None or t.op != "b" or t.cond != 14:
+                        break
+                    targets.append(t.pc)
+            elif ins.cond == 14:
+                targets = self._run(first)  # a jump into unrolled code: any of its instructions
+            else:
+                return None
+            if ins.cond != 14:
+                targets = [ins.pc + 4] + targets
             self.switches[ins.pc] = targets
             return targets
-        # offsets relative to a table: ldr rX, [rT, rI, lsl #2] ; add pc, rX, rT
-        if not thumb and ins.op == "add" and ins.rd == 15 and ins.rm is not None and ins.rs is None \
-                and ins.shift_imm == 0:
-            for back in range(1, 4):
-                p = mem.insn(ins.pc - 4 * back, False)
-                if p is not None and p.op == "ldr" and p.rd in (ins.rn, ins.rm) and p.rm is not None \
-                        and p.shift == "lsl" and p.shift_imm == 2:
-                    base_reg = ins.rm if p.rd == ins.rn else ins.rn
-                    table = regs.get(base_reg)
-                    if table is None or p.rn != base_reg:
-                        return None
-                    targets = []
-                    k = 0
-                    limit = None
-                    while k < 1024:
-                        off = mem.u32(table + 4 * k)
-                        if off is None:
-                            break
-                        t = (table + off) & 0xFFFFFFFF
-                        if limit is not None and table + 4 * k >= limit:
-                            break
-                        if not mem.inside(t, 4) or t & 3 or t <= table + 4 * k:
-                            break
-                        ti = mem.insn(t, False)
-                        if ti is None or ti.op == "undefined":
-                            break
-                        targets.append(t)
-                        limit = t if limit is None else min(limit, t)
-                        k += 1
-                    if not targets:
-                        return None
-                    if commit:
-                        self.data.update(range(table, table + 4 * len(targets)))
-                    lr = self._lr_set(ins.pc, False)
-                    if lr is not None:
-                        targets = targets + [lr]
-                    self.switches[ins.pc] = targets
-                    return targets
-        return None
+        # a table of offsets from its own address: ldr rX, [rT, rI{, lsl #2}],
+        # add pc, rT, rX; or add rY, rT, rX, ..., mov pc, rY (bx rY), the
+        # registers followed through the straight line (_consts_step)
+        if ins.shift is not None:
+            return None
+        table = None
+        if ins.op == "add":
+            for a, b in ((ins.rn, ins.rm), (ins.rm, ins.rn)):
+                if a in regs and regs.get(("w", b)) == regs[a]:
+                    table = regs[a]
+        elif ins.op in ("mov", "bx"):
+            table = regs.get(("o", ins.rm))
+        if table is None:
+            return None
+        targets = self._offset_table(table)
+        if not targets:
+            return None
+        if commit:
+            self.data.update(range(table, table + 4 * len(targets)))
+        lr = self._lr_set(ins.pc, False)
+        if lr is not None:
+            targets = targets + [lr]
+        self.switches[ins.pc] = targets
+        return targets
+
+    def _offset_table(self, table):
+        """Targets of a table of words that are offsets from the table to ARM
+        code, before or after it: read while each one lands on an instruction,
+        outside the table, and before the first target that follows it."""
+        mem = self.mem
+        targets, limit = [], None
+        for k in range(1024):
+            at = table + 4 * k
+            if limit is not None and at >= limit:
+                break
+            off = mem.u32(at)
+            if off is None:
+                break
+            t = (table + off) & 0xFFFFFFFF
+            if not mem.inside(t, 4) or t & 3 or table <= t < at + 4:
+                break
+            ti = mem.insn(t, False)
+            if ti is None or ti.op == "undefined":
+                break
+            targets.append(t)
+            if t > table:
+                limit = t if limit is None else min(limit, t)
+        return targets
+
+    def _run(self, first, limit=1024):
+        """The ARM instructions from `first` to the first that does not run on
+        (a transfer with no condition), that one included."""
+        out = []
+        a = first
+        while len(out) < limit:
+            ins = self.mem.insn(a, False)
+            if ins is None or ins.op == "undefined" or any(b in self.data for b in range(a, a + 4)):
+                break
+            out.append(a)
+            if ins.writes_pc and ins.cond == 14 and not ins.is_call:
+                break
+            a += 4
+        return out
 
     def _bound(self, at, reg, thumb):
-        """N from the `cmp reg, #N` that guards a switch (within a few instructions)."""
+        """N from the `cmp reg, #N` that guards a switch, walking back through
+        a straight line (conditional branches out of it included); through
+        `subs reg, rX, #k` after a `cmp rX, #N` (a range of cases from k): N - k."""
         step = 2 if thumb else 4
-        for back in range(1, 6):
+        k = 0
+        for back in range(1, 10):
             p = self.mem.insn(at - step * back, thumb)
             if p is None:
                 return None
             if p.op == "cmp" and p.rn == reg and p.imm is not None:
-                return p.imm
-            if p.rd == reg or p.writes_pc:
+                return p.imm - k if p.imm >= k else None
+            if p.op == "sub" and p.s and p.rd == reg and p.imm is not None and p.rn != reg \
+                    and p.cond == 14 and p.shift is None:
+                reg, k = p.rn, k + p.imm
+                continue
+            if reg in _clobbers(p) or (p.writes_pc and (p.cond == 14 or p.is_call)):
                 return None
         return None
 
@@ -469,12 +603,14 @@ class Program:
         out = set()
         for (t, thumb), places in cand.items():
             ins = self.mem.insn(t, thumb)
-            if ins is None:
+            if ins is None or ins.cond != 14:     # no function opens with a condition
                 continue
             v = t | thumb
             in_table = any(self._pointer_neighbour(p) for p in places)
             if _is_prologue(ins, self.mem):
                 ok = self._clean_descent(t, thumb)
+            elif v in self.literal_loaded and self._boundary(t, thumb):
+                ok = self._clean_descent(t, thumb)      # both: even `bx lr` alone (an empty callback)
             elif v in self.literal_loaded or in_table or self._boundary(t, thumb):
                 ok = self._clean_descent(t, thumb, minimum=4)
             else:
