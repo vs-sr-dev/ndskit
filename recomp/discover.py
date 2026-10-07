@@ -39,14 +39,18 @@ output (the compiler of NitroSDK games) and the SDK's hand-written parts:
    nothing runs after them. That holds on a straight line only: when the
    walk applied it across an address that something also jumps to (a
    join, reached with other flags), the function is walked again without
-   it from there.
+   it from there. Conditional `add/sub rX, pc, #k` make rX one of several
+   code addresses (`addhs r4, pc, #a; addlo r4, pc, #b; ...; bx r4`):
+   each is taken as an entry.
 5. Literal loads mark their bytes as data.
 6. Switches. CodeWarrior's ARM switch: `cmp rI, #N` ... `addls pc, pc,
    rI, lsl #2`, then the default's `b` and N + 1 entries, each one
    instruction (a `b` to the case) walked as code; the bound is found
    back through the straight line, conditional branches out of it
    included, and through `subs rI, rX, #k` after `cmp rX, #N` (a range of
-   cases from k, `addpl`). With no bound, a table of branches is read
+   cases from k, `addpl`); for `addge` after `cmp rI, #0` (the lower
+   bound) the upper one further back (`cmp rI, #N; bgt default`). With
+   no bound, a table of branches is read
    while its entries are branches, and an unconditional `add pc, pc, rI,
    lsl #2` into code that is not a table (the SDK's unrolled division)
    takes every instruction of the run it lands in. Tables of offsets from
@@ -54,20 +58,32 @@ output (the compiler of NitroSDK games) and the SDK's hand-written parts:
    with rT a constant, then `add pc, rT, rX`, or `add rY, rT, rX` ...
    `mov pc, rY` (`bx rY`), the registers followed through the straight
    line; entries are read while each lands on an instruction outside the
-   table, before or after it; with lr set first (`add lr, pc, #n`) it is a
-   call.
+   table, before or after it, an offset of 0 being a hole (a code with no
+   case); with lr set first (`add lr, pc, #n`) it is a call.
 7. Unreached code: after the pass, a word in the data that points into a
    segment is a function reached by pointer (a callback, a handler, a
    virtual method) if its descent meets no undefined instruction and no
    data, its first instruction has no condition, and it either opens with
-   a stack-frame prologue (`push {..., lr}` or `stmdb sp!`), is loaded by
-   the code as a literal, or sits in a run of at least two such pointers
-   (a table) -- four instructions at least, unless it is both loaded as a
-   literal and placed after data or a function's end (an empty callback
-   is a lone `bx lr`). Failing that, unclassified words right after a
-   function's end or a literal pool that open with a prologue are taken
-   the same way (the linker places whole object files, so uncalled
-   functions sit between called ones). Repeat to a fixed point.
+   a stack-frame prologue (`push {..., lr}` or `stmdb sp!`), or has two of
+   three marks: loaded by the code as a literal, in a table (a neighbouring
+   word points at a function, a prologue or a veneer), placed after data
+   or a function's end (or after an unclassified word that is a return:
+   C++'s tiny virtual methods sit in a row) -- then even a lone `bx lr`
+   (an empty callback, an empty static constructor) is one; with one mark,
+   four instructions at least, or in a table a veneer to a known entry
+   (an interrupt table's `ldr r12, =handler; mov r0, #n; bx r12`). The
+   table's mark spreads to a fixed point within the pass (a vtable of
+   small methods), and a pointer of a table or a literal into code
+   already walked inside another function, after a function's end, is
+   an entry too (a thunk that adjusts `this` and branches into the method
+   it shares). Failing that, unclassified words right after a function's
+   end or a literal pool that open with a prologue are taken the same way
+   (the linker places whole object files, so uncalled functions sit
+   between called ones). Repeat to a fixed point.
+8. Context saves: a function that stores an address of its own code to
+   memory returns twice (NitroSDK's OS_SaveContext); the return addresses
+   of the calls to it are landings, where a context loaded later comes
+   back (`returns_twice`, `landings`; the recompiler unwinds to them).
 
 `Program` keeps: funcs {entry: Function}, code {address: size}, data
 (byte addresses), switches {jump address: [targets]}, the calls and jumps
@@ -78,13 +94,13 @@ instruction that writes pc from a value, what the walk took it for
 its target when known): the recompiler (recomp.emit) works from them.
 
 Checked on Moon's ARM9 against Ghidra 12's auto-analysis (ndskit/ghidra):
-of Ghidra's 4 680 functions, 4 648 found as entries and 15 inside another
-function's code (entries a few bytes apart, shared tails), 17 not reached
-(15 of them hand-written decoder routines reached through tables of
-offsets whose base is in a register set elsewhere); 765 more found that
-Ghidra has not. Its ARM7: 535 of Ghidra's 536 (the
-program read where its autoloads run). No conflict on Moon or two other
-cartridges.
+of Ghidra's 4 680 functions, 4 666 found as entries and 14 inside another
+function's code (entries a few bytes apart, shared tails), none left;
+6 580 functions in all, 1 914 that Ghidra has not (most of them C++'s
+small virtual methods and thunks, reached through vtables). Its ARM7
+(session 2): 535 of Ghidra's 536 (the program read where its autoloads
+run). No conflict on Moon or two other cartridges; and the runtime ran
+Moon from its boot into its first room on what this finds.
 Known gaps: CodeWarrior's Thumb switches (`add pc, rI` after a `lsl`;
 a Thumb-heavy 2008 cartridge leaves half its ARM9 unclassified), and the
 switches through tables of halfword offsets in a newer SDK's ARM7 (`cmp
@@ -246,10 +262,18 @@ class Program:
             for a, b in ((ins.rn, ins.rm), (ins.rm, ins.rn)):
                 if a in regs and regs.get(("w", b)) == regs[a]:
                     sym = ("o", regs[a])
+        # a conditional `add/sub rd, pc, #k`: rd is one of several code addresses
+        # (`addhs r4, pc, #a; addlo r4, pc, #b; ...; bx r4`)
+        alt = None
+        if ins.op in ("add", "sub") and ins.rn == 15 and ins.target is not None and ins.cond != 14:
+            alt = set(regs.get(("alt", ins.rd), ())) | {ins.target}
         for r in _clobbers(ins):
             regs.pop(r, None)
             regs.pop(("w", r), None)
             regs.pop(("o", r), None)
+            regs.pop(("alt", r), None)
+        if alt is not None:
+            regs[("alt", ins.rd)] = alt
         if ins.rd is not None:
             if val is not None:
                 regs[ins.rd] = val
@@ -308,6 +332,7 @@ class Program:
                         if v is not None:
                             self.literal_loaded.add(v)
                 src = regs.get(ins.rm) if ins.rm is not None else None
+                src_alt = regs.get(("alt", ins.rm)) if ins.rm is not None else None
                 if ins.rm == 15 and ins.op in ("bx", "blx"):
                     src = ins.pc + (4 if thumb else 8)      # bx pc: Thumb's veneer into ARM
                 lr_before = regs.get(14)
@@ -390,6 +415,9 @@ class Program:
                     (f.calls if lr is not None else f.tails).add((target & ~1, bool(target & 1)))
                 else:
                     f.unresolved.append((pc, kind + ins.text))
+                    if op in ("bx", "mov") and ins.imm is None and src_alt:   # one of several: each an entry
+                        for t in src_alt:
+                            (f.calls if lr is not None else f.tails).add((t & ~1, op == "bx" and bool(t & 1)))
                 if lr is not None:
                     if lr & ~1 != nxt:
                         todo.append((lr & ~1, {}))
@@ -427,7 +455,7 @@ class Program:
         # CodeWarrior: [cmp rI, #N] addls pc, pc, rI, lsl #2 ; b default ; N+1 entries
         if ins.op == "add" and ins.rd == 15 and ins.rn == 15 and ins.shift == "lsl" and ins.shift_imm == 2:
             first = ins.pc + 8
-            n = self._bound(ins.pc, ins.rm, thumb)
+            n = self._bound(ins.pc, ins.rm, thumb, signed=ins.cond == 10)
             if n is not None:
                 targets = [first + 4 * k for k in range(n + 1)]
             elif mem.insn(first, False) is not None and mem.insn(first, False).op == "b":
@@ -473,9 +501,11 @@ class Program:
     def _offset_table(self, table):
         """Targets of a table of words that are offsets from the table to ARM
         code, before or after it: read while each one lands on an instruction,
-        outside the table, and before the first target that follows it."""
+        outside the table, and before the first target that follows it. An
+        offset of 0 is a hole (a code with no case), skipped while a target
+        follows (four in a row end the table)."""
         mem = self.mem
-        targets, limit = [], None
+        targets, limit, holes = [], None, 0
         for k in range(1024):
             at = table + 4 * k
             if limit is not None and at >= limit:
@@ -483,6 +513,12 @@ class Program:
             off = mem.u32(at)
             if off is None:
                 break
+            if off == 0 and targets:
+                holes += 1
+                if holes == 4:
+                    break
+                continue
+            holes = 0
             t = (table + off) & 0xFFFFFFFF
             if not mem.inside(t, 4) or t & 3 or table <= t < at + 4:
                 break
@@ -509,7 +545,7 @@ class Program:
             a += 4
         return out
 
-    def _bound(self, at, reg, thumb):
+    def _bound(self, at, reg, thumb, signed=False):
         """N from the `cmp reg, #N` that guards a switch, walking back through
         a straight line (conditional branches out of it included); through
         `subs reg, rX, #k` after a `cmp rX, #N` (a range of cases from k): N - k."""
@@ -520,6 +556,8 @@ class Program:
             if p is None:
                 return None
             if p.op == "cmp" and p.rn == reg and p.imm is not None:
+                if signed and p.imm == 0 and not k:
+                    continue            # `addge` after `cmp rI, #0`: the lower bound; the upper is further back
                 return p.imm - k if p.imm >= k else None
             if p.op == "sub" and p.s and p.rd == reg and p.imm is not None and p.rn != reg \
                     and p.cond == 14 and p.shift is None:
@@ -568,7 +606,47 @@ class Program:
             last = len(self.entries)
             for a, t in new:
                 self.entries[a] = t
+        self.returns_twice = self._returns_twice()
+        self.landings = self._landings()
         return self
+
+    def _returns_twice(self):
+        """Functions that store an address of their own code to memory: a
+        context save (NitroSDK's OS_SaveContext: `add r0, pc, #k; str r0,
+        [r1, #0x3c]`, then `mov r0, #0; bx lr`), which returns once now and
+        again when the context is loaded, at the stored address."""
+        out = set()
+        for e, f in self.funcs.items():
+            if f.thumb or not f.code:
+                continue
+            hi = max(f.code) + 0x20
+            for a in sorted(f.code):
+                ins = self.mem.insn(a, False)
+                if ins.op not in ("add", "sub") or ins.rn != 15 or ins.target is None or ins.rd in (14, 15) \
+                        or not e <= ins.target < hi:
+                    continue
+                for b in range(a + 4, a + 20, 4):
+                    j = self.mem.insn(b, False)
+                    if b not in f.code or j is None:
+                        break
+                    if j.op == "str" and j.rd == ins.rd:
+                        out.add(e)
+                        break
+                    if ins.rd in _clobbers(j) or j.writes_pc:
+                        break
+        return out
+
+    def _landings(self):
+        """{caller entry: return addresses of its calls to a function that
+        returns twice}: where control comes back without a call when the saved
+        context is loaded (recomp.emit makes them labels to unwind to)."""
+        out = {}
+        for e, f in self.funcs.items():
+            for a in f.code:
+                ins = self.mem.insn(a, f.thumb)
+                if ins.op in ("bl", "blx") and ins.target is not None and ins.target in self.returns_twice:
+                    out.setdefault(e, set()).add(a + ins.size)
+        return out
 
     def _clean_descent(self, a, thumb, minimum=1):
         f = Function(a, thumb)
@@ -581,6 +659,17 @@ class Program:
             return False
         return True
 
+    def _veneer(self, a, thumb):
+        """A short clean descent that ends in a jump to a known entry: an
+        interrupt table's stubs (`ldr r12, =handler; mov r0, #n; bx r12`)."""
+        f = Function(a, thumb)
+        saved = dict(self.entries)
+        self._walk(f, commit=False)
+        self.entries = saved
+        if f.conflicts or len(f.code) < 2 or any(c in self.code for c in f.code):
+            return False
+        return any(t in self.entries for t, _ in f.tails)
+
     def _data_words(self):
         """Word-aligned addresses that are data or unclassified, inside the segments."""
         for s in self.mem.segs:
@@ -589,7 +678,7 @@ class Program:
                     yield a
 
     def _pointer_seeds(self):
-        cand = {}
+        cand, inner = {}, {}
         for a in self._data_words():
             v = self.mem.u32(a)
             if v is None:
@@ -597,45 +686,95 @@ class Program:
             t, thumb = v & ~1, bool(v & 1)
             if not self.mem.inside(t, 2) or (not thumb and t & 3) or t in self.entries:
                 continue
+            if t in self.code and self.code[t] == (2 if thumb else 4):
+                inner.setdefault((t, thumb), []).append(a)
+                continue
             if t in self.code or t in self.data:
                 continue
             cand.setdefault((t, thumb), []).append(a)
-        out = set()
-        for (t, thumb), places in cand.items():
-            ins = self.mem.insn(t, thumb)
-            if ins is None or ins.cond != 14:     # no function opens with a condition
-                continue
-            v = t | thumb
-            in_table = any(self._pointer_neighbour(p) for p in places)
-            if _is_prologue(ins, self.mem):
-                ok = self._clean_descent(t, thumb)
-            elif v in self.literal_loaded and self._boundary(t, thumb):
-                ok = self._clean_descent(t, thumb)      # both: even `bx lr` alone (an empty callback)
-            elif v in self.literal_loaded or in_table or self._boundary(t, thumb):
-                ok = self._clean_descent(t, thumb, minimum=4)
-            else:
-                ok = False
-            if ok:
+        # a pointer counts as in a table when a neighbour points at a function,
+        # one accepted in this pass included: repeat to a fixed point (the
+        # descents are remembered, so a pass costs little)
+        out, self._accepted, memo = set(), set(), {}
+
+        def once(fn, *args):
+            if args not in memo:
+                memo[args] = fn(*args)
+            return memo[args]
+
+        pending = dict(cand)
+        while True:
+            added = False
+            for (t, thumb), places in list(pending.items()):
+                ins = self.mem.insn(t, thumb)
+                if ins is None or ins.cond != 14:     # no function opens with a condition
+                    del pending[(t, thumb)]
+                    continue
+                v = t | thumb
+                in_table = any(self._pointer_neighbour(p) for p in places)
+                lit, bound = v in self.literal_loaded, self._boundary(t, thumb)
+                if _is_prologue(ins, self.mem):
+                    ok = once(self._clean_descent, t, thumb, 1)
+                elif lit + in_table + bound >= 2:
+                    ok = once(self._clean_descent, t, thumb, 1)    # two of the three: even `bx lr` alone
+                elif lit or in_table or bound:
+                    ok = once(self._clean_descent, t, thumb, 4) or in_table and once(self._veneer, t, thumb)
+                else:
+                    ok = False
+                if ok:
+                    out.add((t, thumb))
+                    self._accepted.add(t)
+                    del pending[(t, thumb)]
+                    added = True
+            if not added:
+                break
+        # code already walked as part of another function (a thunk that adjusts
+        # `this` and branches into the method, both in vtables): an entry too, when
+        # a table or a literal points at it and it starts after a function's end
+        for (t, thumb), places in inner.items():
+            if ((t | thumb) in self.literal_loaded or any(self._pointer_neighbour(p) for p in places)) \
+                    and self._boundary(t, thumb):
                 out.add((t, thumb))
         return out
 
     def _boundary(self, a, thumb):
-        """a follows data, or the last instruction of code that does not run on."""
+        """a follows data, or the last instruction of code that does not run on;
+        or, unclassified, a word that is a return (`bx lr`, `pop {..., pc}`):
+        the end of an unreached function (tiny virtual methods sit in a row)."""
         prev = a - (2 if thumb else 4)
         if prev in self.data:
             return True
+        pi = self.mem.insn(prev, thumb)
         if prev in self.code:
-            pi = self.mem.insn(prev, thumb)
             return pi is not None and pi.writes_pc and pi.cond == 14 and not pi.is_call
-        return False
+        if pi is None or pi.cond != 14:
+            return False
+        return (pi.op == "bx" and pi.rm == 14) or (pi.op == "ldm" and pi.rn == 13 and bool(pi.reglist >> 15 & 1))
 
     def _pointer_neighbour(self, p):
         for q in (p - 4, p + 4):
             v = self.mem.u32(q)
             if v is not None and self.mem.inside(v & ~1, 2) and ((v & 1) or not v & 3):
                 ins = self.mem.insn(v & ~1, bool(v & 1))
-                if ins is not None and (_is_prologue(ins) or (v & ~1) in self.entries):
+                if ins is not None and (_is_prologue(ins) or (v & ~1) in self.entries
+                                        or (v & ~1) in getattr(self, "_accepted", ())
+                                        or self._veneer_shape(v & ~1, bool(v & 1))):
                     return True
+        return False
+
+    def _veneer_shape(self, a, thumb):
+        """`ldr rX, [pc, #k]`, then `bx rX` within the next two instructions."""
+        ins = self.mem.insn(a, thumb)
+        if ins is None or thumb or ins.op != "ldr" or ins.rn != 15 or ins.cond != 14 or ins.rd in (13, 14, 15):
+            return False
+        for b in (a + 4, a + 8):
+            j = self.mem.insn(b, False)
+            if j is None:
+                return False
+            if j.op == "bx" and j.rm == ins.rd and j.cond == 14:
+                return True
+            if ins.rd in _clobbers(j) or j.writes_pc:
+                return False
         return False
 
     def _prologue_seeds(self):

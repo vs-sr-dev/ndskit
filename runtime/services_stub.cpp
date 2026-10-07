@@ -24,6 +24,8 @@ void arm_bad_return(ArmContext& c, uint32_t expected) {
     std::exit(1);
 }
 void arm_call_unknown(ArmContext& c, uint32_t key) { fail(c, "call to a non-entry", key); }
+void arm_context_saved(ArmContext& c) { (void)c; }
+void arm_exception_return(ArmContext& c, uint32_t target) { arm_restore_cpsr(c, target); }
 
 static uint32_t g_cp15[8][16][16][8];
 
@@ -45,3 +47,7 @@ void nds_mmio_write(int cpu, uint32_t a, uint32_t v, int size) {
     std::fprintf(stderr, "ndskit: ARM%d %d-byte write of %08X to %08X (no hardware)\n", cpu, size, v, a);
     std::exit(1);
 }
+
+int g_arm_trace;
+void nds_watch_hit(int cpu, uint32_t a, uint32_t v, int size) { (void)cpu; (void)a; (void)v; (void)size; }
+void arm_trace_enter(ArmContext& c, uint32_t key) { (void)c; (void)key; }

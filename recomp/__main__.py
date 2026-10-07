@@ -1,20 +1,25 @@
 """Recompile a DS cartridge's programs (or flat ARM images) to C++, one module per program.
 
     python -m ndskit.recomp GAME.nds --out build/recomp [--cpu 9,7] [--per-file 8000]
-                            [--no-comments] [--optest]
+                            [--no-comments] [--optest] [--copy CPU:DEST=SRC:LEN ...]
     python -m ndskit.recomp --image NAME=FILE@BASE:CPU[+SEED,...] ... --out DIR
 
 Each program is discovered (recomp/discover.py) where it runs, in segments
 (the main block and each autoload at its destination), and emitted into its
 own namespace, p_<name> (p_arm9, p_arm7). The runtime activates, for each
 CPU, the module whose segments it finds in memory (arm_identify, by each
-segment's crc32). Writes, into --out:
+segment's crc32). --copy adds a block the program copies elsewhere at run
+time and runs there (code moved to the ITCM for speed): the bytes at SRC,
+LEN long, as a segment at DEST, discovered from DEST; the runtime names
+such a block when it meets a call into one. Writes, into --out:
 
     p_<name>_funcs.h        prototypes and the module descriptor
     p_<name>_NNN.cpp        the functions, split by instruction count
-    p_<name>_table.cpp      the module: segments with their crc32, entries
+    p_<name>_table.cpp      the module: segments with their crc32, entries,
+                            the landings (returns to a context save's callers)
     modules.cpp             every module of the build (g_arm_modules)
-    CMakeLists.txt          the library `recomp`, the runtime, the self-test
+    CMakeLists.txt          the library `recomp`, the runtime, the self-test,
+                            ndsrun (the machine, headless)
     report.txt              per module: functions, the transfers through
                             registers by how they were resolved, targets
                             that are not entries
@@ -66,6 +71,23 @@ def parse_image(spec):
     where, _, seeds = where.partition("+")
     base, _, cpu = where.partition(":")
     return name, path, int(base, 16), int(cpu or 9), [int(s, 16) for s in seeds.split(",") if s]
+
+
+def parse_copy(spec):
+    """CPU:DEST=SRC:LEN (hex) -> (cpu, dest, src, len)."""
+    cpu, _, rest = spec.partition(":")
+    dest, _, rest = rest.partition("=")
+    src, _, n = rest.partition(":")
+    return int(cpu), int(dest, 16), int(src, 16), int(n, 16)
+
+
+def copy_segment(segs, dest, src, n):
+    """A block of a program that it copies elsewhere at run time (code made
+    to run from the ITCM, say), as a segment at its destination."""
+    for s in segs:
+        if s.base <= src and src + n <= s.end:
+            return discover.Segment(dest, s.data[src - s.base:src - s.base + n], "copy")
+    raise SystemExit("--copy: %08X-%08X is not inside one segment of the program" % (src, src + n))
 
 
 def volatile_literals(prog):
@@ -144,13 +166,18 @@ class Module:
             f.write('#include "%s_funcs.h"\n\nnamespace %s {\n\n' % (self.ns, self.ns))
             f.write("static const ArmSegment segs[] = {\n")
             for s in self.segs:
-                f.write("    {0x%08Xu, 0x%Xu, 0x%08Xu},  // %s\n" % (s.base, len(s.data), zlib.crc32(s.data), s.name))
+                f.write("    {0x%08Xu, 0x%Xu, 0x%08Xu, %d},  // %s\n" % (
+                    s.base, len(s.data), zlib.crc32(s.data), int(s.name == "copy"), s.name))
             f.write("};\n\nstatic const ArmFuncEntry funcs[] = {\n")
             for k in keys:
                 f.write("    {0x%08Xu, %s},\n" % (k, E.fname(k & ~1, k & 1)))
             f.write("};\n\n")
-            f.write('extern const ArmModule module = {"%s", %d, segs, %d, funcs, %d};\n'
-                    % (self.name, self.cpu, len(self.segs), len(keys)))
+            land = sorted({r | int(prog.funcs[e].thumb) for e, rs in prog.landings.items() for r in rs})
+            if land:
+                f.write("static const uint32_t landings[] = {%s};\n\n" % ", ".join("0x%08Xu" % t for t in land))
+            f.write('extern const ArmModule module = {"%s", %d, segs, %d, funcs, %d, %s, %d};\n'
+                    % (self.name, self.cpu, len(self.segs), len(keys), "landings" if land else "nullptr",
+                       len(land)))
             f.write("\n}  // namespace %s\n" % self.ns)
         self.files.append(self.ns + "_table.cpp")
 
@@ -171,6 +198,9 @@ target_compile_options(recomp PRIVATE -Wno-unused-label -Wno-unused-variable -Wn
 include(${{NDSKIT_RUNTIME}}/runtime.cmake)
 add_executable(selftest ${{NDSKIT_RUNTIME}}/selftest.cpp)
 target_link_libraries(selftest ndskit_core ndskit_stub recomp)
+# the machine, headless: a cartridge's programs run (ndskit/runtime/main.cpp)
+add_executable(ndsrun ${{NDSKIT_RUNTIME}}/main.cpp)
+target_link_libraries(ndsrun ndskit_core ndskit_machine recomp)
 # a project can add its own targets (the game) with -DNDSKIT_EXTRA=file.cmake
 if(DEFINED NDSKIT_EXTRA)
   include(${{NDSKIT_EXTRA}})
@@ -236,6 +266,8 @@ def main(argv=None):
     ap.add_argument("rom", nargs="?", help="a cartridge (.nds)")
     ap.add_argument("--cpu", default="9,7", help="which programs of the cartridge (9, 7 or 9,7)")
     ap.add_argument("--image", action="append", default=[], help="NAME=FILE@BASE:CPU[+SEED,...]")
+    ap.add_argument("--copy", action="append", default=[],
+                    help="CPU:DEST=SRC:LEN (hex): code the program copies at run time, recompiled where it runs")
     ap.add_argument("--out", required=True)
     ap.add_argument("--per-file", type=int, default=8000)
     ap.add_argument("--no-comments", action="store_true")
@@ -248,7 +280,12 @@ def main(argv=None):
             rom = Rom(fh.read())
         for cpu in (int(x) for x in a.cpu.split(",") if x):
             segs, entry = discover.segments_from_rom(rom, cpu)
-            specs.append(("ARM%d" % cpu, segs, cpu, [entry]))
+            seeds = [entry]
+            for c, dest, src, n in (parse_copy(x) for x in a.copy):
+                if c == cpu:
+                    segs.append(copy_segment(segs, dest, src, n))
+                    seeds.append(dest)
+            specs.append(("ARM%d" % cpu, segs, cpu, seeds))
     for spec in a.image:
         name, path, base, cpu, seeds = parse_image(spec)
         with open(path, "rb") as fh:

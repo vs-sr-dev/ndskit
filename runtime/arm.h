@@ -30,6 +30,7 @@ struct ArmContext {
     uint32_t bank[ARM_NBANKS][2];       // r13, r14 of the banks not in use
     uint32_t fiq_other[5];              // r8-r12 of the other side of FIQ
     uint32_t spsr[ARM_NBANKS];
+    uint32_t irq;                       // an interrupt is pending (IME, IE & IF): the runtime keeps it
 };
 
 typedef void (*ArmFunc)(ArmContext&);
@@ -38,7 +39,7 @@ typedef void (*ArmFunc)(ArmContext&);
 // they run (to recognise them), and its entries sorted by key (the address,
 // bit 0 set for Thumb).
 struct ArmFuncEntry { uint32_t key; ArmFunc fn; };
-struct ArmSegment { uint32_t base, size, crc; };
+struct ArmSegment { uint32_t base, size, crc, copied; };   // copied: put there by the program at run time
 struct ArmModule {
     const char* name;
     int cpu;
@@ -46,7 +47,14 @@ struct ArmModule {
     uint32_t nsegs;
     const ArmFuncEntry* funcs;
     uint32_t nfuncs;
+    const uint32_t* landings;           // return addresses of calls to a context save (sorted keys)
+    uint32_t nlandings;
 };
+
+// A return that went to a landing of the active module, not to the call's
+// own address: a saved context was loaded. The runtime throws it; the
+// functions holding the landing catch it around their calls and go on there.
+struct ArmUnwind { uint32_t pc; };
 
 // ---- memory -------------------------------------------------------------------------
 extern uint8_t g_main[];                // 4 MiB at 0x02000000, repeated to 0x02FFFFFF
@@ -56,6 +64,10 @@ extern uint8_t g_wram7[];               // ARM7: 64 KiB at 0x03800000, repeated 
 extern uint8_t g_swram[];               // shared WRAM, 32 KiB: the ARM7's over 0x03000000-0x037FFFFF
                                         // (WRAMCNT = 3, as the SDK's boot leaves it)
 extern uint32_t g_dtcm_base;
+extern uint32_t g_dtcm_size;            // 0x4000 while CP15 enables the DTCM, else 0
+// A store watch (a debugging aid): every store into [g_watch_lo, +g_watch_len) is reported.
+extern uint32_t g_watch_lo, g_watch_len;
+void nds_watch_hit(int cpu, uint32_t a, uint32_t v, int size);
 uint32_t nds_io_read(int cpu, uint32_t a, int size);    // everything else (core.cpp)
 void     nds_io_write(int cpu, uint32_t a, uint32_t v, int size);
 uint32_t nds_mmio_read(int cpu, uint32_t a, int size);  // what nds_io_* does not hold: the hardware
@@ -63,7 +75,7 @@ void     nds_mmio_write(int cpu, uint32_t a, uint32_t v, int size);
 
 template <int CPU> static inline uint8_t* nds_fast(uint32_t a) {
     if (CPU == 9) {
-        if (a - g_dtcm_base < 0x4000u) return g_dtcm + (a - g_dtcm_base);
+        if (a - g_dtcm_base < g_dtcm_size) return g_dtcm + (a - g_dtcm_base);
         if (a < 0x02000000u) return g_itcm + (a & 0x7FFFu);
     }
     if (a >> 24 == 0x02) return g_main + (a & 0x3FFFFFu);
@@ -88,15 +100,18 @@ template <int CPU> static inline uint32_t nds_ld32(uint32_t a) {
     return nds_io_read(CPU, a, 4);
 }
 template <int CPU> static inline void nds_st8(uint32_t a, uint32_t v) {
+    if (ARM_UNLIKELY(a - g_watch_lo < g_watch_len)) nds_watch_hit(CPU, a, v & 0xFFu, 1);
     if (uint8_t* p = nds_fast<CPU>(a)) *p = (uint8_t)v;
     else nds_io_write(CPU, a, v & 0xFFu, 1);
 }
 template <int CPU> static inline void nds_st16(uint32_t a, uint32_t v) {
+    if (ARM_UNLIKELY(a - g_watch_lo < g_watch_len)) nds_watch_hit(CPU, a, v & 0xFFFFu, 2);
     uint16_t w = (uint16_t)v;
     if (uint8_t* p = nds_fast<CPU>(a)) std::memcpy(p, &w, 2);
     else nds_io_write(CPU, a, v & 0xFFFFu, 2);
 }
 template <int CPU> static inline void nds_st32(uint32_t a, uint32_t v) {
+    if (ARM_UNLIKELY(a - g_watch_lo + 3 < g_watch_len + 3)) nds_watch_hit(CPU, a, v, 4);
     if (uint8_t* p = nds_fast<CPU>(a)) std::memcpy(p, &v, 4);
     else nds_io_write(CPU, a, v, 4);
 }
@@ -199,6 +214,7 @@ static inline void arm_set_cpsr(ArmContext& c, uint32_t v, uint32_t mask) {
     if (mask & 1 && c.mode != 0x10) {
         c.i = v >> 7 & 1; c.f = v >> 6 & 1;
         arm_set_mode(c, (v & 0x1F) | 0x10);
+        if (c.irq && !c.i) c.budget = 0;    // unmasked with one pending: taken at the next safe point
     }
 }
 static inline void arm_set_nzcv(ArmContext& c, uint32_t v) {
@@ -207,6 +223,8 @@ static inline void arm_set_nzcv(ArmContext& c, uint32_t v) {
 uint32_t arm_get_spsr(const ArmContext& c);              // the CPSR in user and system mode
 void     arm_set_spsr(ArmContext& c, uint32_t v, uint32_t mask);
 // subs pc, lr, #n / ldm ..., {..., pc}^: CPSR = SPSR, then c.pc = target in the restored state
+// (arm_restore_cpsr); the services decide where that goes (another thread's context)
+void     arm_restore_cpsr(ArmContext& c, uint32_t target);
 void     arm_exception_return(ArmContext& c, uint32_t target);
 uint32_t arm_user_reg(const ArmContext& c, int n);       // ldm/stm with ^
 void     arm_set_user_reg(ArmContext& c, int n, uint32_t v);
@@ -224,9 +242,15 @@ uint32_t arm_cp15_read(ArmContext& c, int op1, int crn, int crm, int op2);
 void     arm_cp15_write(ArmContext& c, int op1, int crn, int crm, int op2, uint32_t v);
 void     arm_bad_return(ArmContext& c, uint32_t expected);   // a return went elsewhere
 void     arm_call_unknown(ArmContext& c, uint32_t key);  // services: a call to a non-entry
+void     arm_context_saved(ArmContext& c);               // a context save returned (its caller's sp)
 
 // A safe point: backward jumps, calls, and an msr that may unmask interrupts.
 #define ARM_POLL(c) do { if (ARM_UNLIKELY(--(c).budget < 0)) arm_poll(c); } while (0)
+// At each function's entry: when the runtime traces calls (a debugging aid), it
+// is told; otherwise one predictable branch.
+extern int g_arm_trace;
+void arm_trace_enter(ArmContext& c, uint32_t key);
+#define ARM_ENTER(c, k) do { if (ARM_UNLIKELY(g_arm_trace)) arm_trace_enter(c, k); } while (0)
 // After a call: the callee's return must have come back here.
 #define ARM_RET(c, a) do { if (ARM_UNLIKELY((c).pc != (a))) arm_bad_return(c, a); } while (0)
 
@@ -239,4 +263,5 @@ const ArmModule* arm_module(const char* name);
 bool    arm_identify(const ArmModule* m);                // its segments are in memory, as built
 void    arm_activate(const ArmModule* m);                // the one module of its CPU
 ArmFunc arm_lookup(int cpu, uint32_t key);               // nullptr if not an entry
+bool    arm_is_landing(int cpu, uint32_t key);           // a landing of the active module
 uint32_t nds_crc32(const uint8_t* p, size_t n, uint32_t crc = 0);

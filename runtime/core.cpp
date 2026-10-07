@@ -2,6 +2,7 @@
 // directly, the processor modes and their banked registers, and the
 // key -> function dispatch over the active modules (one per CPU).
 #include "arm.h"
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 #include <vector>
@@ -12,6 +13,8 @@ alignas(64) uint8_t g_dtcm[0x4000 + 8];
 alignas(64) uint8_t g_wram7[0x10000 + 8];
 alignas(64) uint8_t g_swram[0x8000 + 8];
 uint32_t g_dtcm_base = 0x027E0000u;            // where the SDK's crt0 puts it (CP15 c9,c1,0)
+uint32_t g_dtcm_size = 0x4000u;
+uint32_t g_watch_lo, g_watch_len;              // no watch                // on (the runtime follows CP15's control register)
 
 // ---- the address map outside the fast paths ------------------------------------------
 uint32_t nds_io_read(int cpu, uint32_t a, int size) { return nds_mmio_read(cpu, a, size); }
@@ -77,7 +80,7 @@ void arm_set_spsr(ArmContext& c, uint32_t v, uint32_t mask) {
     c.spsr[b] = (c.spsr[b] & ~m) | (v & m);
 }
 
-void arm_exception_return(ArmContext& c, uint32_t target) {
+void arm_restore_cpsr(ArmContext& c, uint32_t target) {
     uint32_t t = 0;
     if (bank_of(c.mode) != ARM_BANK_USR) {
         uint32_t s = c.spsr[bank_of(c.mode)];
@@ -124,6 +127,7 @@ const ArmModule* arm_module(const char* name) {
 bool arm_identify(const ArmModule* m) {
     for (uint32_t s = 0; s < m->nsegs; ++s) {
         const ArmSegment& g = m->segs[s];
+        if (g.copied) continue;                    // not there until the program copies it
         std::vector<uint8_t> buf(g.size);          // a segment may span two memories (the ARM7's WRAMs)
         if (!nds_mem_read(m->cpu, g.base, buf.data(), g.size)) return false;
         if (nds_crc32(buf.data(), g.size) != g.crc) return false;
@@ -145,6 +149,14 @@ ArmFunc arm_lookup(int cpu, uint32_t key) {
     }
     if (lo < m->nfuncs && m->funcs[lo].key == key) return m->funcs[lo].fn;
     return nullptr;
+}
+
+bool arm_is_landing(int cpu, uint32_t key) {
+    const ArmModule* m = g_active[cpu == 9 ? 0 : 1];
+    if (!m || !m->nlandings) return false;
+    const uint32_t* e = m->landings + m->nlandings;
+    const uint32_t* p = std::lower_bound(m->landings, e, key);
+    return p != e && *p == key;
 }
 
 void arm_call(ArmContext& c, uint32_t key) {

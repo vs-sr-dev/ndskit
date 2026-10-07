@@ -34,7 +34,14 @@ the semantics of ndskit/armemu.py instruction for instruction:
   `ldm ..., {..., pc}^`), CP15, SWI and undefined instructions as runtime
   calls (arm_set_cpsr, arm_cp15_*, arm_swi, arm_undefined...);
 * safe points (ARM_POLL) at backward jumps, before calls and after an
-  msr that can unmask interrupts.
+  msr that can unmask interrupts;
+* at each function's entry ARM_ENTER: one branch on a flag, so the
+  runtime can trace calls and stop at a function when asked;
+* a context save (a function that returns twice, discover.Program.
+  returns_twice): after a call to it the runtime is told
+  (arm_context_saved), and in its callers every call catches ArmUnwind and
+  goes on at the call's return address it names (Program.landings), where
+  a context loaded later comes back.
 
 Every multi-statement instruction is its own block, so a `goto` never
 crosses an initialisation.
@@ -138,6 +145,8 @@ class Body:
         self.sites = {}
         self.unknown = []
         self.landings = self._landings()
+        self.land = sorted(getattr(prog, "landings", {}).get(f.entry, ()))
+        self.twice = getattr(prog, "returns_twice", frozenset())
         self.live = self._liveness()
 
     # ---- analysis -----------------------------------------------------
@@ -599,6 +608,15 @@ class Body:
             return "arm_call(c, x);"
         return "if (x == %s) %s(c); else arm_call(c, x);" % (_h(k), fname(k & ~1, k & 1))
 
+    def _unwind(self, call):
+        """A call and its return check, in a function holding landings (the
+        return addresses of its calls to a context save): a context loaded
+        later comes back to one of them by unwinding (ArmUnwind)."""
+        if not self.land:
+            return call
+        cases = " ".join("if (u.pc == %s) goto L_%08X;" % (_h(t | self.T), t) for t in self.land)
+        return "try { %s } catch (const ArmUnwind& u) { %s throw; }" % (call, cases)
+
     def _back(self):
         """After a jump: control returned to one of this function's own lr
         addresses goes on there; anything else returns."""
@@ -670,8 +688,10 @@ class Body:
         if op in ("bl", "blx") and ins.target is not None:
             to_thumb = (not self.thumb) if op == "blx" else self.thumb
             ret = nxt | T
-            return ("%s = %s; ARM_POLL(c); %s ARM_RET(c, %s);"
-                    % (_r(14), _h(ret), self._call(ins.target | int(to_thumb)), _h(ret))), True
+            saved = " arm_context_saved(c);" if ins.target in self.twice else ""
+            return ("%s = %s; ARM_POLL(c); %s%s"
+                    % (_r(14), _h(ret), self._unwind("%s ARM_RET(c, %s);" % (
+                        self._call(ins.target | int(to_thumb)), _h(ret))), saved)), True
         if op in ("bl_hi", "bl_lo", "blx_lo"):
             raise Unsupported("%08X: a lone half of a Thumb bl" % a)
         pre, v, iw = self._value(ins)
@@ -681,9 +701,9 @@ class Body:
         kind, target, ret = self.f.sites.get(a, ("call" if op == "blx" else "jump", None, None))
         if op == "blx":                          # blx rm: lr is set here
             ret = nxt | T
-            return ("{ %sconst uint32_t x = %s; %s = %s; ARM_POLL(c); %s ARM_RET(c, %s); }"
-                    % (pre, key, _r(14), _h(ret), self._dcall(target, "resolved" if target is not None
-                                                              else "unresolved"), _h(ret))), True
+            return ("{ %sconst uint32_t x = %s; %s = %s; ARM_POLL(c); %s }"
+                    % (pre, key, _r(14), _h(ret), self._unwind("%s ARM_RET(c, %s);" % (
+                        self._dcall(target, "resolved" if target is not None else "unresolved"), _h(ret))))), True
         if kind == "return":
             return "{ %s%s }" % (pre, self._return(key)), False
         if kind == "switch":
@@ -703,8 +723,9 @@ class Body:
                 after = " goto L_%08X;" % (r & ~1)
             else:                                 # lr is another function's entry: go on there
                 after = " " + self._tail(r if r & 1 else r & ~3)
-            return ("{ %sconst uint32_t x = %s; ARM_POLL(c); %s ARM_RET(c, %s);%s }"
-                    % (pre, key, self._dcall(target, how), _h(r), after)), (r & ~1) == nxt
+            return ("{ %sconst uint32_t x = %s; ARM_POLL(c); %s%s }"
+                    % (pre, key, self._unwind("%s ARM_RET(c, %s);" % (self._dcall(target, how), _h(r))),
+                       after)), (r & ~1) == nxt
         # a jump
         if target is not None:
             k = target if target & 1 else target & ~3
@@ -719,7 +740,7 @@ class Body:
 
     # ---- the function -----------------------------------------------------
     def labels(self):
-        out = set(self.landings)
+        out = set(self.landings) | set(self.land)
         code = self.f.code
         for a, ins in self.ops.items():
             if ins.op == "b" and ins.target in code:
@@ -755,7 +776,8 @@ class Body:
         labels = self.labels()
         code = self.f.code
         order = sorted(code)
-        lines = ["void %s(ArmContext& c) {" % fname(self.f.entry, self.thumb)]
+        lines = ["void %s(ArmContext& c) {" % fname(self.f.entry, self.thumb),
+                 "    ARM_ENTER(c, %s);" % _h(self.f.entry | self.T)]
         if order[0] != self.f.entry:              # code shared from below the entry
             labels.add(self.f.entry)
             lines.append("    goto L_%08X;" % self.f.entry)
