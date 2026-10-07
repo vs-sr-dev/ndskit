@@ -21,7 +21,7 @@ knowledge. Game formats and game fixes live in the ports.
 
 | Port | Game | What it asked of ndskit |
 |---|---|---|
-| pc-moon | Moon (2009) | the cartridge (header, ModuleParams and autoloads, FNT/FAT, NitroROM images nested as archives), the address maps, the BIOS's LZ77, SDAT, the ARM/Thumb decoder |
+| pc-moon | Moon (2009) | the cartridge (header, ModuleParams and autoloads of both CPUs, FNT/FAT, NitroROM images nested as archives), the address maps, the BIOS's LZ77, SDAT, the ARM/Thumb decoder, function discovery for CodeWarrior's ARM code (switches, veneers, hand-written dispatch) with the programs read where they run |
 
 ## Using it
 
@@ -41,6 +41,8 @@ python -m ndskit.arm GAME.nds --offset 4000 --size SIZE --base 02000000 --at 020
 python -m ndskit.arm FILE --base 02000000 --refs 04000000:04002000   # who loads a register's address
 python -m ndskit.hw 04000400 04000540                # names, as the ARM9 sees them
 python -m ndskit.hw --arm7 04000400                  # and the ARM7
+python -m ndskit.recomp.discover GAME.nds --cpu 9 --report --out funcs9.tsv   # every function, ARM or Thumb
+python -m ndskit.recomp.discover GAME.nds --cpu 7                              # the ARM7, where its autoloads run
 ```
 
 ## Layers
@@ -49,8 +51,8 @@ python -m ndskit.hw --arm7 04000400                  # and the ARM7
 |---|---|---|---|
 | 1. Recognise | What is on this cartridge? | `rom --info`: header and its CRCs, the secure area's state, both programs, NitroSDK's ModuleParams (autoloads to ITCM/DTCM, static BSS, compression, SDK version), overlay tables, banner (titles, icon) | a `fingerprint`: the SDK's ARM7 components by crc32, the SDK's libraries and middleware (Mobiclip, CRI, ...) by signature |
 | 2. Extract | Turn standard formats into standard files | `rom --extract` (files, `sys/` with header, programs, overlays and banner; NitroROM images inside, `--nested`; the SDK's backward LZ undone), `lz` (LZ10, LZ11, RLE), `sdat` (every record, files named by their symbols) | G2D (NCLR/NCGR/NSCR/NCER/NANR) to images, NSBMD/NSBTX, SWAV/STRM to WAV, NARC, NFTR |
-| 3. Map code | What does the code do, where? | `arm` (ARMv5TE and Thumb decoder, disassembly with literals resolved and registers named, `--refs`, `--census`), `hw` (both CPUs' address maps and register names) | function discovery for CodeWarrior's ARM/Thumb code, an ARM interpreter as the recompiler's oracle, SDK names by signature |
-| 4. Translate | Turn ARM code into C++ | | the recompiler: conditions, interworking, the PC as a register, switch tables, literal pools, processor modes |
+| 3. Map code | What does the code do, where? | `arm` (ARMv5TE and Thumb decoder, disassembly with literals resolved and registers named, `--refs`, `--census`), `hw` (both CPUs' address maps and register names), `ghidra/ExportFuncs.java` | an ARM interpreter as the recompiler's oracle, SDK names by signature |
+| 4. Translate | Turn ARM code into C++ | `recomp.discover` (recursive descent over ARM and Thumb with the mode carried through interworking; the program read in segments where it runs, its autoloads included; constants through straight lines for veneers and calls through registers; CodeWarrior's `addls pc` switches; hand-written jumps through tables of offsets; returns set up in lr; pointer, boundary and prologue seeds to a fixed point) | Thumb switches; the recompiler: conditions, interworking, the PC as a register, processor modes |
 | 5. Runtime | Replace the hardware | | memory with VRAM banks, interrupts, timers, DMA, IPC, the cartridge, the BIOS's SWIs; the ARM7 as a coroutine; the 2D engines; the geometry engine and an OpenGL renderer at any resolution; the sound channels; SDL3 |
 
 ## Principles
@@ -71,12 +73,17 @@ python -m ndskit.hw --arm7 04000400                  # and the ARM7
 | `lz` | Moon: 251 scene and 252 collision files, every one decoded to its stated size (479 LZ10, 24 LZ11), the stream ending within the file |
 | `sdat` | Moon's sound archive: 43 sequences, 1 sequence archive with 67 named sequences, 31 banks, 1 wave archive, 1 player, every one named by its symbol and its file in range |
 | `hw` | register names from GBATEK; those seen in Moon's code noted as they are met |
+| `rom` (ARM7 ModuleParams) | found by its shape (the autoload list ending at the program's end) on three cartridges of SDK 4.1, 4.2 and 5.4: two autoloads each, to the ARM7's WRAM and to 0x027E0000 |
+| `recomp.discover` | Moon's ARM9 against Ghidra 12: 4 663 of Ghidra's 4 680 functions covered (4 646 as entries, 17 inside another's code), the 17 left hand-written decoder routines reached through register-based tables; 749 more found. Its ARM7: 535 of 536, 390 more. 0 conflicts (no descent meets data or an undefined instruction) on Moon and on two other cartridges, a Thumb-heavy one included |
 
 ## Known gaps
 
 * `rom`: compressed overlays are read (the OVT's flag) but none has been
   met yet; the backward LZ is checked on an ARM9 only.
 * `lz`: Huffman (types 0x2x) is not done.
+* `recomp.discover`: CodeWarrior's Thumb switches are not recognised yet;
+  tables whose base a register carries from elsewhere stay unresolved
+  (the runtime will report their targets, to be given as seeds).
 * `arm`: should-be-zero fields are checked for MRS, MSR, BX, BLX, CLZ and
   PLD only; cp10/cp11 decode as plain coprocessor instructions (their v5
   meaning); there is no code/data or ARM/Thumb region detection yet, so

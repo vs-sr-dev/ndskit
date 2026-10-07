@@ -147,6 +147,23 @@ def module_params(rom, code):
     return ModuleParams(code, code.plain, off)
 
 
+def module_params7(code):
+    """The ARM7's ModuleParams, which has no footer: found by its shape.
+
+    The SDK's ARM7 programs carry the same block as the ARM9's, near their
+    start, and in both the autoload list is the last thing in the program:
+    a block whose list ends exactly at the program's end, starts inside it
+    and is a whole number of 12-byte entries is taken to be it.
+    """
+    end = code.ram + code.size
+    for off in range(0, min(len(code.data), 0x2000) - 0x1C, 4):
+        lst, lend, start = struct.unpack_from("<3I", code.data, off)
+        if lend == end and code.ram <= lst < lend and (lend - lst) % 12 == 0 \
+                and code.ram <= start < end and lend - lst <= 12 * 16:
+            return ModuleParams(code, code.data, off)
+    return None
+
+
 class Overlay:
     def __init__(self, data, off):
         (self.id, self.ram, self.ram_size, self.bss_size, self.sinit_start, self.sinit_end,
@@ -181,6 +198,7 @@ class Rom:
         self.overlays9 = [Overlay(data, o9 + i) for i in range(0, s9, 32)]
         self.overlays7 = [Overlay(data, o7 + i) for i in range(0, s7, 32)]
         self.params = module_params(self, self.arm9)
+        self.params7 = module_params7(self.arm7)
         self.names = {}     # file id -> path
         self.dirs = {}      # dir id -> path
         if self.fnt_size:
@@ -286,6 +304,12 @@ def info(rom, out=print):
         for addr, size, bss, src in p.autoloads:
             out("  autoload 0x%08X size 0x%X bss 0x%X  (from 0x%08X)  %s"
                 % (addr, size, bss, src, region_name(addr)))
+    p7 = rom.params7
+    if p7:
+        out("ARM7 ModuleParams at 0x%08X (found by its shape)" % p7.address)
+        for addr, size, bss, src in p7.autoloads:
+            out("  autoload 0x%08X size 0x%X bss 0x%X  (from 0x%08X)  %s"
+                % (addr, size, bss, src, region_name(addr, 7)))
     out("FNT         0x%08X size 0x%X; FAT 0x%08X, %d files in %d directories"
         % (rom.fnt_off, rom.fnt_size, rom.fat_off, len(rom.fat), len(rom.dirs)))
     out("overlays    ARM9 %d, ARM7 %d" % (len(rom.overlays9), len(rom.overlays7)))
@@ -302,10 +326,10 @@ def info(rom, out=print):
             out("  %-9s %s" % (lang, t.replace("\n", " / ")))
 
 
-def region_name(addr):
+def region_name(addr, cpu=9):
     try:
         from . import hw
-        return hw.name(addr) or ""
+        return hw.name(addr, cpu) or ""
     except ImportError:
         return ""
 
