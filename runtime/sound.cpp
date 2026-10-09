@@ -2,11 +2,13 @@
 // mixer.
 //
 // The unit makes a stereo sample every 1 024 system cycles (2 048 ticks,
-// 32 728.5 Hz). It is run lazily, in virtual time: up to the running CPU's
-// time at each access to its registers, and up to the machine's at each
-// frame's end (sound_sync), so a run is the same run every time, with or
-// without anyone listening, and a channel's busy bit ends when its samples
-// do.
+// 32 728.5 Hz). It runs in virtual time (sound_sync): up to the machine's
+// time after each quantum (a quarter of a line, half a sample), and up to the
+// ARM7's at each access to its registers. So a run is the same run every
+// time, with or without anyone listening, a channel's busy bit ends when its
+// samples do, and a channel reads memory as it stands at its own time: run
+// only now and then, it read later than it played, and a stream the ARM9
+// refills behind the play position came out with the next lap's samples.
 //
 // Each output sample, every channel's timer (the system clock / 2, counting
 // up from the channel's reload) advances 512, and each overflow steps the
@@ -17,9 +19,12 @@
 // of a 15-bit LFSR. A sampled channel starts 3 steps late (ADPCM spends the
 // first 8 nibbles' time on its header); with less than 16 bytes in all it
 // plays nothing. A one-shot channel ends after its last sample: silent, the
-// busy bit cleared. The samples are read through the ARM7's memory map when
-// they are played (the hardware's FIFO reads up to 32 bytes ahead: only data
-// changed while it plays would tell).
+// busy bit cleared. The samples come through a FIFO as the hardware's do: 32
+// bytes fetched as the channel starts, 16 more each time it is down to 16.
+// A stream refilled behind the play position counts on that read-ahead
+// (Moon's movies rewrite each 256-byte block of their ring buffer the
+// moment the play position leaves it: read at the moment of playing, the
+// block's last samples were already the next lap's).
 //
 // The mix, in integers at the hardware's widths (GBATEK; melonDS's
 // arithmetic): a channel's sample times 16 >> the divider's shift (0, 1, 2,
@@ -50,6 +55,10 @@ struct Channel {
     int32_t cur;                                    // the sample being output
     uint16_t lfsr;
     int32_t adpcm, index, adpcm_loop, index_loop;
+    uint8_t byte;                                   // ADPCM: the byte whose nibbles play
+    uint8_t fifo[32];                               // the samples fetched ahead
+    uint32_t fifo_rd, fifo_wr, fifo_level;          // bytes
+    uint32_t fetch;                                 // the next fetch's offset from the source
 };
 
 struct Capture {
@@ -75,19 +84,44 @@ const int8_t kAdpcmIndex[8] = {-1, -1, -1, -1, 2, 4, 6, 8};
 uint32_t reg32(uint32_t off) { uint32_t v; std::memcpy(&v, &g_regs[off], 4); return v; }
 uint16_t reg16(uint32_t off) { uint16_t v; std::memcpy(&v, &g_regs[off], 2); return v; }
 
-template <class T> T sample_at(uint32_t a) {
-    T v{};
-    if (uint8_t* p = nds_fast<7>(a)) std::memcpy(&v, p, sizeof v);
-    return v;                                       // the sound's DMA reads memory only (an inference for VRAM)
+int fmt(const Channel& c) { return c.cnt >> 29 & 3; }
+
+// The FIFO: a burst of 16 bytes from where the fetches stand (back to the
+// loop start past the end; nothing past a one-shot's end).
+void fetch(Channel& c) {
+    uint32_t end = c.loop + c.len;
+    if (c.fetch >= end) {
+        if (c.cnt & 1u << 27) c.fetch = c.loop;
+        else return;
+    }
+    uint32_t n = std::min(16u, end - c.fetch);
+    for (uint32_t i = 0; i < n; i += 4) {
+        uint32_t w = 0;
+        if (uint8_t* p = nds_fast<7>(c.src + c.fetch)) std::memcpy(&w, p, 4);   // memory only (VRAM: an inference)
+        std::memcpy(&c.fifo[c.fifo_wr], &w, 4);
+        c.fifo_wr = (c.fifo_wr + 4) & 31;
+        c.fetch += 4;
+    }
+    c.fifo_level += n;
 }
 
-int fmt(const Channel& c) { return c.cnt >> 29 & 3; }
+// The next sample's bytes from the FIFO, which fetches again once half empty.
+template <class T> T take(Channel& c) {
+    T v;
+    std::memcpy(&v, &c.fifo[c.fifo_rd], sizeof v);
+    c.fifo_rd = (c.fifo_rd + sizeof v) & 31;
+    c.fifo_level -= sizeof v;
+    if (c.fifo_level <= 16) fetch(c);
+    return v;
+}
 
 void start(Channel& c) {
     c.timer = c.reload;
     c.pos = fmt(c) == 3 ? -1 : -3;
     c.cur = 0;
     c.lfsr = 0x7FFF;
+    c.fifo_rd = c.fifo_wr = c.fifo_level = c.fetch = 0;
+    if (fmt(c) != 3) { fetch(c); fetch(c); }        // 32 bytes as the channel starts
 }
 
 void stop(Channel& c, int n) {
@@ -107,7 +141,7 @@ void step(Channel& c, int n) {
             if (c.cnt & 1u << 27) c.pos = (int32_t)c.loop;
             else { stop(c, n); return; }
         }
-        c.cur = sample_at<int8_t>(c.src + c.pos) * 256;
+        c.cur = take<int8_t>(c) * 256;
         return;
     case 1:
         if (++c.pos < 0) return;
@@ -115,12 +149,12 @@ void step(Channel& c, int n) {
             if (c.cnt & 1u << 27) c.pos = (int32_t)(c.loop / 2);
             else { stop(c, n); return; }
         }
-        c.cur = sample_at<int16_t>(c.src + 2 * c.pos);
+        c.cur = take<int16_t>(c);
         return;
     case 2: {
         if (++c.pos < 8) {
             if (c.pos == 0) {
-                uint32_t h = sample_at<uint32_t>(c.src);
+                uint32_t h = take<uint32_t>(c);
                 c.adpcm = c.adpcm_loop = (int16_t)h;
                 c.index = c.index_loop = std::min<int32_t>(h >> 16 & 0x7F, 88);
             }
@@ -131,10 +165,12 @@ void step(Channel& c, int n) {
             c.pos = (int32_t)(c.loop * 2);
             c.cur = c.adpcm = c.adpcm_loop;
             c.index = c.index_loop;
+            c.byte = take<uint8_t>(c);
             return;
         }
-        uint8_t byte = sample_at<uint8_t>(c.src + c.pos / 2);
-        uint32_t nib = c.pos & 1 ? byte >> 4 : byte & 15;
+        if (c.pos & 1) c.byte >>= 4;
+        else c.byte = take<uint8_t>(c);
+        uint32_t nib = c.byte & 15;
         int32_t s = kAdpcmStep[c.index], d = s >> 3;
         if (nib & 1) d += s >> 2;
         if (nib & 2) d += s >> 1;

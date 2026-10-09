@@ -197,7 +197,7 @@ void input_parse(const std::string& script);
 void input_vblank(uint64_t vblank);     // sets the buttons and the stylus held at this VBlank
 
 // ---- sound (sound.cpp) -----------------------------------------------------------------
-// The sound unit runs lazily in virtual time: sound_sync mixes up to a time.
+// The sound unit runs in virtual time: sound_sync mixes up to a time (each quantum, each register access).
 static const uint64_t kSampleTicks = 2048;     // an output sample: 1 024 system cycles (32 728.5 Hz)
 void sound_reset();
 void sound_write(uint32_t addr, uint32_t v, int size);

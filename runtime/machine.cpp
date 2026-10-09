@@ -598,7 +598,7 @@ bool nds_run_frame() {
         run_cpu(7);
         g_now = g_qend;
         fire_events();
-        if (g_vblanks != vbl) sound_sync(g_now);    // the frame's sound, whatever touched it
+        sound_sync(g_now);                          // the sound in step with the memory the CPUs write
         if (g_cfg.stop_vblanks && g_vblanks >= g_cfg.stop_vblanks) nds_stop("VBlank limit");
     }
     return g_vblanks != vbl;
