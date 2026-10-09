@@ -66,10 +66,15 @@ output (the compiler of NitroSDK games) and the SDK's hand-written parts:
    virtual method) if its descent meets no undefined instruction and no
    data, its first instruction has no condition, and it either opens with
    a stack-frame prologue (`push {..., lr}` or `stmdb sp!`), or has two of
-   three marks: loaded by the code as a literal, in a table (a neighbouring
-   word points at a function, a prologue or a veneer), placed after data
-   or a function's end (or after an unclassified word that is a return:
-   C++'s tiny virtual methods sit in a row) -- then even a lone `bx lr`
+   marks: loaded by the code as a literal, in a table (a neighbouring
+   word points at a function, a prologue or a veneer; or the word 8 or 12
+   bytes away does, past small words: C++'s pointers to member functions
+   are records of the function and one or two adjustments; candidates
+   with a boundary and a clean descent count for each other), placed after
+   data or a function's end (or after an unclassified word that is a
+   return, or such a return's literal pool: C++'s tiny virtual methods sit
+   in a row), and, with that boundary, filling a gap (a few instructions
+   to a return, then known code or a prologue) -- then even a lone `bx lr`
    (an empty callback, an empty static constructor) is one; with one mark,
    four instructions at least, or in a table a veneer to a known entry
    (an interrupt table's `ldr r12, =handler; mov r0, #n; bx r12`). The
@@ -761,6 +766,15 @@ class Program:
             return memo[args]
 
         pending = dict(cand)
+        # candidates that start where a function would (a boundary) and descend
+        # clean: as a table's neighbour each counts for the others, so a table of
+        # tiny methods none of which is known yet still stands
+        self._bounded = set()
+        for (t, thumb) in cand:
+            ins = self.mem.insn(t, thumb)
+            if ins is not None and ins.cond == 14 and self._boundary(t, thumb) \
+                    and once(self._clean_descent, t, thumb, 1):
+                self._bounded.add(t)
         while True:
             added = False
             for (t, thumb), places in list(pending.items()):
@@ -771,9 +785,10 @@ class Program:
                 v = t | thumb
                 in_table = any(self._pointer_neighbour(p) for p in places)
                 lit, bound = v in self.literal_loaded, self._boundary(t, thumb)
+                gap = bound and self._fills_gap(t, thumb)
                 if _is_prologue(ins, self.mem):
                     ok = once(self._clean_descent, t, thumb, 1)
-                elif lit + in_table + bound >= 2:
+                elif lit + in_table + bound + gap >= 2:
                     ok = once(self._clean_descent, t, thumb, 1)    # two of the three: even `bx lr` alone
                 elif lit or in_table or bound:
                     ok = once(self._clean_descent, t, thumb, 4) or in_table and once(self._veneer, t, thumb)
@@ -797,7 +812,8 @@ class Program:
 
     def _boundary(self, a, thumb):
         """a follows data, or the last instruction of code that does not run on;
-        or, unclassified, a word that is a return (`bx lr`, `pop {..., pc}`):
+        or, unclassified, a word that is a return (`bx lr`, `pop {..., pc}`),
+        or the literal pool of such a return (`ldr r0, [pc]; bx lr; .word k`):
         the end of an unreached function (tiny virtual methods sit in a row)."""
         prev = a - (2 if thumb else 4)
         if prev in self.data:
@@ -805,17 +821,70 @@ class Program:
         pi = self.mem.insn(prev, thumb)
         if prev in self.code:
             return pi is not None and pi.writes_pc and pi.cond == 14 and not pi.is_call
+        if self._ret(pi):
+            return True
+        if thumb:
+            return False
+        for n in (1, 2):                      # a pool of one or two words after a return
+            pool = a - 4 * n
+            ri = self.mem.insn(pool - 4, False)
+            if pool - 4 in self.code or not self._ret(ri):
+                continue
+            for b in range(pool - 16, pool - 4, 4):
+                li = self.mem.insn(b, False)
+                if li is not None and li.literal_size and li.target is not None and pool <= li.target < a:
+                    return True
+        return False
+
+    def _fills_gap(self, a, thumb):
+        """A few straight-line instructions from a that end in a return, right
+        after which (past a literal pool of a word or two) known code or a
+        prologue begins: a tiny function that exactly fills the gap between two
+        others (`mvn r0, #1; bx lr` among a class's methods)."""
+        step = 2 if thumb else 4
+        b = a
+        for _ in range(4):
+            ins = self.mem.insn(b, thumb)
+            if ins is None or ins.cond != 14 or b in self.code or b in self.data:
+                return False
+            if ins.writes_pc:
+                if not self._ret(ins):
+                    return False
+                for nxt in (b + step, b + step + 4, b + step + 8):
+                    if nxt in self.code or nxt in self.entries:
+                        return True
+                    ni = self.mem.insn(nxt, thumb)
+                    if ni is not None and _is_prologue(ni):
+                        return True
+                return False
+            b += step
+        return False
+
+    @staticmethod
+    def _ret(pi):
         if pi is None or pi.cond != 14:
             return False
         return (pi.op == "bx" and pi.rm == 14) or (pi.op == "ldm" and pi.rn == 13 and bool(pi.reglist >> 15 & 1))
 
     def _pointer_neighbour(self, p):
-        for q in (p - 4, p + 4):
+        near = [p - 4, p + 4]
+        # C++ pointers to member functions sit in tables of records of two or
+        # three words, the function and small adjustments (`this`, a vtable
+        # offset): the neighbour is 8 or 12 bytes away past small words
+        def small(a):
+            m = self.mem.u32(a)
+            return m is not None and (m < 0x1000 or m > 0xFFFFF000)
+        for step in (8, 12):
+            for sign in (-1, 1):
+                if all(small(p + sign * k) for k in range(4, step, 4)):
+                    near.append(p + sign * step)
+        for q in near:
             v = self.mem.u32(q)
             if v is not None and self.mem.inside(v & ~1, 2) and ((v & 1) or not v & 3):
                 ins = self.mem.insn(v & ~1, bool(v & 1))
                 if ins is not None and (_is_prologue(ins) or (v & ~1) in self.entries
                                         or (v & ~1) in getattr(self, "_accepted", ())
+                                        or (v & ~1) in getattr(self, "_bounded", ())
                                         or self._veneer_shape(v & ~1, bool(v & 1))):
                     return True
         return False
