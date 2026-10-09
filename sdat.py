@@ -2,6 +2,7 @@
 
     python -m ndskit.sdat SOUND.sdat --info          # blocks and counts per kind
     python -m ndskit.sdat SOUND.sdat --list          # every record, with its name and file
+    python -m ndskit.sdat SOUND.sdat --waves         # wave formats, rates, loops; PCM, PSG, noise instruments
     python -m ndskit.sdat SOUND.sdat --extract DIR   # the files, named by their symbols
 
 The SDK's sound library (SND on the ARM9, its driver on the ARM7) plays
@@ -120,16 +121,88 @@ class Sdat:
         return self.data[off:off + size]
 
 
+WAVE_FORMATS = ["PCM8", "PCM16", "ADPCM"]
+INSTRUMENTS = {0: "empty", 1: "PCM", 2: "PSG", 3: "noise", 4: "direct PCM", 5: "null",
+               16: "drum set", 17: "key split"}
+
+
+def swar_waves(data):
+    """A SWAR's waves: (format, loops, rate, timer, loop start, length after it), the last two in bytes."""
+    if data[:4] != b"SWAR":
+        raise ValueError("not a SWAR")
+    n = struct.unpack_from("<I", data, 0x38)[0]
+    out = []
+    for i in range(n):
+        o = struct.unpack_from("<I", data, 0x3C + 4 * i)[0]
+        fmt, loop, rate, timer, lstart, llen = struct.unpack_from("<BBHHHI", data, o)
+        out.append((WAVE_FORMATS[fmt] if fmt < 3 else fmt, bool(loop), rate, timer, lstart * 4, llen * 4))
+    return out
+
+
+def sbnk_instruments(data):
+    """A SBNK's programs: (program, type, [(type, wave, wave archive), ...]) for each one not empty.
+
+    A drum set or a key split lists its regions' instruments; a PSG's wave is its duty cycle."""
+    if data[:4] != b"SBNK":
+        raise ValueError("not a SBNK")
+    n = struct.unpack_from("<I", data, 0x38)[0]
+    out = []
+    for i in range(n):
+        t, o = struct.unpack_from("<BH", data, 0x3C + 4 * i)
+        if t == 0:
+            continue
+        if t < 16:
+            subs = [(t,) + struct.unpack_from("<HH", data, o)]
+        elif t == 16:
+            lo, hi = data[o], data[o + 1]
+            subs = [struct.unpack_from("<HHH", data, o + 2 + 12 * j) for j in range(hi - lo + 1)]
+        else:
+            regions = sum(1 for b in data[o:o + 8] if b)
+            subs = [struct.unpack_from("<HHH", data, o + 8 + 12 * j) for j in range(regions)]
+        out.append((i, t, subs))
+    return out
+
+
+def waves_report(s, out=print):
+    """What the waves are made of and which instruments play them: formats, rates, loops; PSG and noise."""
+    from collections import Counter
+    total, rates = Counter(), Counter()
+    for r in s.records["WAVEARC"]:
+        if r.file_id is None:
+            continue
+        w = swar_waves(s.file(r.file_id))
+        c = Counter(f for f, *_ in w)
+        total.update(c)
+        rates.update(rate for _, _, rate, *_ in w)
+        loops = sum(1 for _, lp, *_ in w if lp)
+        out("WAVEARC %4d  %-28s %4d waves  %s  %d looped" % (
+            r.index, r.name or "-", len(w), " ".join("%s:%d" % kv for kv in sorted(c.items())), loops))
+    out("waves: %s" % " ".join("%s:%d" % kv for kv in sorted(total.items())))
+    out("rates: %s" % " ".join("%d:%d" % kv for kv in rates.most_common(8)))
+    kinds, used = Counter(), Counter()
+    for r in s.records["BANK"]:
+        if r.file_id is None:
+            continue
+        for _, t, subs in sbnk_instruments(s.file(r.file_id)):
+            kinds[INSTRUMENTS.get(t, t)] += 1
+            used.update(INSTRUMENTS.get(st, st) for st, *_ in subs)
+    out("programs: %s" % " ".join("%s:%d" % kv for kv in kinds.most_common()))
+    out("instruments in them: %s" % " ".join("%s:%d" % kv for kv in used.most_common()))
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("sdat")
     ap.add_argument("--info", action="store_true")
     ap.add_argument("--list", action="store_true")
+    ap.add_argument("--waves", action="store_true", help="wave formats, rates, loops; instrument kinds")
     ap.add_argument("--extract", metavar="DIR")
     a = ap.parse_args(argv)
     with open(a.sdat, "rb") as f:
         s = Sdat(f.read())
-    if a.info or not (a.list or a.extract):
+    if a.waves:
+        waves_report(s)
+    if a.info or not (a.list or a.extract or a.waves):
         print("%d files, %s symbols" % (len(s.fat), "with" if s.symb_off else "no"))
         for k in KINDS:
             r = s.records[k]
