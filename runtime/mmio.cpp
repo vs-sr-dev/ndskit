@@ -35,6 +35,7 @@ void mmio_reset() {
     io_set16(9, 0x04000304u, 0x820F);              // POWCNT1: both screens, both 2D engines, 3D
     io_set16(9, 0x04000300u, 0x0001);              // POSTFLG
     io_set16(7, 0x04000300u, 0x0001);
+    io_set16(7, 0x04000304u, 0x0001);              // POWCNT2: the speakers on (the SDK only adds the wireless)
     io_set16(9, 0x04000246u, 0x0300);              // WRAMCNT = 3 (byte 0x247): all the shared WRAM to the ARM7
     io_set16(7, 0x04000240u, 0x0300);              // WRAMSTAT (byte 0x241)
     io_set16(7, 0x04000504u, 0x0200);              // SOUNDBIAS

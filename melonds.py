@@ -12,13 +12,20 @@ Checked on a 2025 build against a cartridge's known memory:
     NDSG + 0x14 + 0x1000000  the shared WRAM (32 KiB)
          + 0x8000            the ARM7's WRAM (64 KiB)
     CP15 + 0x1C              the ITCM (32 KiB), then the DTCM (16 KiB)
+    SPU. + 0x10              the sound unit (melonDS's SPU::DoSavestate): SOUNDCNT, the master
+                             volume, the bias, 12 more bytes, then 105 bytes a channel (its
+                             registers, timer, place, samples, ADPCM state, FIFO) and 51 a
+                             capture unit
 
 --compare reads what ndskit's runtime writes when a run stops (ndsrun:
 main.bin, itcm.bin, dtcm.bin, swram.bin, wram7.bin; cpus.txt with the DTCM's
 base) and lists, for each memory, how many bytes differ and where: runs of
 differing bytes merged across gaps of under 16, the largest first. The
 VBlank count the SDK keeps (0x027FFC3C) is shown for both, to choose the
-state and the run's length so the two stand at the same frame.
+state and the run's length so the two stand at the same frame. When the
+run wrote the ARM7's registers (io7.bin) the sound channels of both are
+listed after the memories, with each one's place in its samples
+(sound.txt).
 """
 import argparse
 import os
@@ -68,6 +75,46 @@ class State:
 
     def u32(self, addr):
         return struct.unpack("<I", self.read(addr, 4))[0]
+
+    def sound(self):
+        """The sound unit from the "SPU." section, as the registers 0x04000400-0x0400051F
+        would read (0x120 bytes), and each channel's play state ((pos, timer, sample))."""
+        o = self.sections["SPU."][0] + 16
+        d = self.data
+        cnt, = struct.unpack_from("<H", d, o)
+        bias, = struct.unpack_from("<H", d, o + 3)
+        o += 17                         # Cnt, MasterVolume, Bias, OutputLastSamples, MixInterval, Mute
+        regs = bytearray(0x120)
+        play = []
+        for n in range(16):             # 105 bytes a channel
+            c_cnt, src, tmr, loop, length = struct.unpack_from("<IIHII", d, o)
+            timer, pos = struct.unpack_from("<Ii", d, o + 22)
+            cur, = struct.unpack_from("<h", d, o + 36)
+            struct.pack_into("<IIHHI", regs, 0x10 * n, c_cnt, src, tmr, loop >> 2, length >> 2)
+            play.append((pos, timer, cur))
+            o += 105
+        struct.pack_into("<H", regs, 0x100, cnt)
+        struct.pack_into("<H", regs, 0x104, bias)
+        for k in range(2):              # 51 bytes a capture unit
+            k_cnt, dst, _, length = struct.unpack_from("<BIHI", d, o)
+            regs[0x108 + k] = k_cnt
+            struct.pack_into("<IH", regs, 0x110 + 8 * k, dst, length >> 2)
+            o += 51
+        return bytes(regs), play
+
+
+def sound_lines(regs):
+    """The sound registers, a line per running channel and one for the unit."""
+    cnt, = struct.unpack_from("<H", regs, 0x100)
+    bias, = struct.unpack_from("<H", regs, 0x104)
+    out = ["SOUNDCNT %04X  bias %03X  capture %02X %02X" % (cnt, bias, regs[0x108], regs[0x109])]
+    for n in range(16):
+        c, src, tmr, pnt, length = struct.unpack_from("<IIHHI", regs, 0x10 * n)
+        if c & 0x80000000:
+            out.append("  ch%-2d %-5s %-8s vol %3d >>%d pan %3d  src %08X  rate %5d Hz  loop %04X len %06X" % (
+                n, ("PCM8", "PCM16", "ADPCM", "PSG")[c >> 29 & 3], ("manual", "loop", "one-shot", "3")[c >> 27 & 3],
+                c & 0x7F, c >> 8 & 3, c >> 16 & 0x7F, src, 16756991 // max(0x10000 - tmr, 1), pnt, length))
+    return out
 
 
 # where each memory sits, for the comparison's addresses
@@ -128,6 +175,22 @@ def compare(state, rundir, nranges=12, ignore=()):
             k = min(e - s, 16)
             print("    %08X-%08X (%5d)  melonDS %s  run %s" % (
                 base + s, base + e, e - s, theirs[s:s + k].hex(), mine[s:s + k].hex()))
+    p = os.path.join(rundir, "io7.bin")
+    if os.path.exists(p):
+        with open(p, "rb") as f:
+            mine = f.read()[0x400:0x520]
+        theirs, play = state.sound()
+        print("sound: melonDS")
+        for line in sound_lines(theirs):
+            print("    " + line)
+        print("    " + "  ".join("ch%d pos %d timer %04X" % (n, play[n][0], play[n][1])
+                                 for n in range(16) if theirs[0x10 * n + 3] & 0x80))
+        print("sound: run")
+        for line in sound_lines(mine):
+            print("    " + line)
+        p = os.path.join(rundir, "sound.txt")
+        if os.path.exists(p):
+            print("    " + "  ".join(line.strip() for line in open(p)))
 
 
 def main(argv=None):
@@ -144,6 +207,8 @@ def main(argv=None):
         for name, (o, n) in sorted(st.sections.items(), key=lambda x: x[1][0]):
             print("%-4s at %08X, %08X bytes" % (name, o, n))
         print("SDK VBlank count: %d" % st.u32(0x027FFC3C))
+        for line in sound_lines(st.sound()[0]):
+            print(line)
     for p in a.peek:
         addr, _, n = p.partition(":")
         addr, n = int(addr, 16), int(n or "10", 16)

@@ -243,19 +243,20 @@ void bios_swi(ArmContext& c, uint32_t num) {
     case 0x12: if (cpu == 7) { lz77(c, true); return; } break;   // the ARM7's LZ77 to VRAM; the ARM9's takes callbacks
     case 0x14: rl(c, false); return;                // RL to WRAM
     case 0x15: if (cpu == 7) { rl(c, true); return; } break;
-    // The ARM7 BIOS's sound tables, worked out from their definitions (an
-    // inference: the BIOS's own values may round differently; phase 6 checks)
+    // The ARM7 BIOS's sound tables, worked out from their definitions; every
+    // value checked against the BIOS's own tables (64, 768 and 724 of them)
     case 0x1A:                                      // GetSineTable: a quarter wave, 64 halfwords
-        if (cpu == 7) { c.r[0] = (uint32_t)std::lround(std::sin((c.r[0] & 63) * 3.14159265358979323846 / 128) * 32768.0) & 0xFFFF; return; }
+        if (cpu == 7) { c.r[0] = (uint32_t)std::lround(std::sin((c.r[0] & 63) * 3.14159265358979323846 / 128) * 32767.0) & 0xFFFF; return; }
         break;
     case 0x1B:                                      // GetPitchTable: 2^(i/768) - 1 in 16.16, 768 halfwords
         if (cpu == 7) { c.r[0] = (uint32_t)std::lround((std::pow(2.0, (c.r[0] % 768) / 768.0) - 1) * 65536.0) & 0xFFFF; return; }
         break;
-    case 0x1C: {                                    // GetVolumeTable: 724 bytes, -72.3 dB to 0 in tenths,
-        if (cpu != 7) break;                        // scaled by the divider the SDK pairs with each range
-        int i = (int)(c.r[0] % 724), db = i - 723;
+    case 0x1C: {                                    // GetVolumeTable: 724 bytes, -72.3 dB to 0 in tenths, out of
+        if (cpu != 7) break;                        // 128, times the divider the SDK pairs with each range; as the
+        int i = (int)(c.r[0] % 724), db = i - 723;  // channels read 127 as 128, 128 is kept as 127 and 127 as 126
         double mul = db < -240 ? 16 : db < -120 ? 4 : db < -60 ? 2 : 1;
-        c.r[0] = (uint32_t)std::min(127L, std::lround(127.0 * std::pow(10.0, db / 200.0) * mul));
+        long v = std::lround(128.0 * std::pow(10.0, db / 200.0) * mul);
+        c.r[0] = (uint32_t)(v >= 128 ? 127 : v == 127 ? 126 : v);
         return;
     }
     }

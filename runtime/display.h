@@ -1,4 +1,4 @@
-// ndskit runtime — the screens: the window, the compositor, pictures.
+// ndskit runtime — the host: the window, the compositor, pictures, the sound out.
 #pragma once
 #include "nds.h"
 #include <string>
@@ -13,3 +13,8 @@ bool display_frame();
 // Both screens of the frame just finished, upper above lower, as a PNG at the DS's size.
 void display_shot(const std::string& path);
 void write_png(const std::string& path, int w, int h, const uint8_t* rgb);   // RGB8, top row first
+
+// The sound to the host (audio.cpp): the audio device (a window's run) and a WAV file.
+bool audio_open(bool device, const std::string& wav);
+void audio_frame();                     // after a VBlank: the frame's samples out
+void audio_close();

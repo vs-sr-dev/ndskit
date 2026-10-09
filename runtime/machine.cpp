@@ -526,6 +526,9 @@ static void dump() {
     std::vector<uint16_t> io(0x1000);
     for (uint32_t i = 0; i < 0x1000; ++i) io[i] = io_reg16(9, 0x04000000u + 2 * i);
     write_file(g_cfg.out + "/io9.bin", io.data(), 0x2000);
+    for (uint32_t i = 0; i < 0x1000; ++i) io[i] = io_reg16(7, 0x04000000u + 2 * i);
+    write_file(g_cfg.out + "/io7.bin", io.data(), 0x2000);
+    sound_dump(g_cfg.out + "/sound.txt");
     FILE* f = std::fopen((g_cfg.out + "/cpus.txt").c_str(), "w");
     if (f) {
         for (int cpu : {9, 7}) {
@@ -565,6 +568,7 @@ bool nds_boot(const NdsConfig& cfg) {
         p.c.budget = g_budget_start[ci(cpu)] = kBudget;
     }
     mmio_reset();
+    sound_reset();
     input_parse(cfg.input);
     system_reset();
     video_reset();
@@ -594,6 +598,7 @@ bool nds_run_frame() {
         run_cpu(7);
         g_now = g_qend;
         fire_events();
+        if (g_vblanks != vbl) sound_sync(g_now);    // the frame's sound, whatever touched it
         if (g_cfg.stop_vblanks && g_vblanks >= g_cfg.stop_vblanks) nds_stop("VBlank limit");
     }
     return g_vblanks != vbl;

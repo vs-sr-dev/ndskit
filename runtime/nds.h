@@ -197,5 +197,12 @@ void input_parse(const std::string& script);
 void input_vblank(uint64_t vblank);     // sets the buttons and the stylus held at this VBlank
 
 // ---- sound (sound.cpp) -----------------------------------------------------------------
+// The sound unit runs lazily in virtual time: sound_sync mixes up to a time.
+static const uint64_t kSampleTicks = 2048;     // an output sample: 1 024 system cycles (32 728.5 Hz)
+void sound_reset();
 void sound_write(uint32_t addr, uint32_t v, int size);
 uint32_t sound_read(uint32_t addr, int size);
+void sound_sync(uint64_t t);
+extern bool g_sound_keep;               // keep the output (someone listens): stereo, interleaved
+std::vector<int16_t>& sound_samples();  // ... mixed since the listener last cleared it
+void sound_dump(const std::string& path);   // the channels' places (a run's end)
