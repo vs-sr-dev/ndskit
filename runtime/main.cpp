@@ -1,7 +1,7 @@
 // ndskit runtime — ndsrun: a cartridge's recompiled programs on the runtime.
 //
 //     ndsrun GAME.nds [--window] [--scale N] [--mute] [--wav FILE] [--out DIR] [--vblanks N]
-//                     [--save FILE] [--shots V,V,...] [--shot-every N] [--input SCRIPT] [--trace]
+//                     [--save FILE] [--save-size BYTES] [--shots V,V,...] [--shot-every N] [--input SCRIPT] [--trace]
 //                     [--ticks9 N] [--ticks7 N] [--no-dump] [--calls N]
 //                     [--break ADDR | --break7 ADDR] [--watch ADDR[:LEN]]
 //
@@ -34,6 +34,7 @@ int main(int argc, char** argv) {
         if (a == "--out") cfg.out = next();
         else if (a == "--vblanks") cfg.stop_vblanks = std::strtoull(next().c_str(), nullptr, 0);
         else if (a == "--save") cfg.save = next();
+        else if (a == "--save-size") cfg.save_size = (uint32_t)std::strtoul(next().c_str(), nullptr, 0);
         else if (a == "--trace") cfg.trace = true;
         else if (a == "--ticks9") cfg.ticks9 = std::atoi(next().c_str());
         else if (a == "--ticks7") cfg.ticks7 = std::atoi(next().c_str());

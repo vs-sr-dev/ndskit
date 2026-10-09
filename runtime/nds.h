@@ -14,6 +14,7 @@ struct NdsConfig {
     std::string rom;                    // the cartridge
     std::string out = "build/run";      // where the run writes (memories, the save, logs)
     std::string save;                   // the backup memory's file (default: OUT/<rom>.sav)
+    uint32_t save_size = 8192;          // its size when the file does not exist yet (the chip's type)
     uint64_t stop_vblanks = 0;          // stop after this many VBlanks (0: never)
     bool trace = false;                 // log the machine's events
     bool dump = true;                   // write the memories when the run stops

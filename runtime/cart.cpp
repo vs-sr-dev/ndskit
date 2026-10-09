@@ -10,7 +10,7 @@
 //
 // The backup memory is an EEPROM (64 Kbit and up: commands with a 2-byte
 // address) or a flash chip (3-byte addresses), its type taken from the
-// save file's size (8 KiB by default).
+// save file's size, or --save-size when there is no file yet (8 KiB by default).
 #include "nds.h"
 #include <cstdio>
 #include <cstring>
@@ -52,14 +52,14 @@ bool cart_open(const std::string& path) {
         size_t d = name.find_last_of('.');
         g_save_path = g_cfg.out + "/" + name.substr(0, d) + ".sav";
     }
-    g_save.assign(8192, 0xFF);
+    g_save.assign(g_cfg.save_size, 0xFF);
     if (FILE* s = std::fopen(g_save_path.c_str(), "rb")) {
         std::fseek(s, 0, SEEK_END);
         long m = std::ftell(s);
         std::fseek(s, 0, SEEK_SET);
         if (m > 0) {
             g_save.resize((size_t)m);
-            if (std::fread(g_save.data(), 1, (size_t)m, s) != (size_t)m) g_save.assign(8192, 0xFF);
+            if (std::fread(g_save.data(), 1, (size_t)m, s) != (size_t)m) g_save.assign(g_cfg.save_size, 0xFF);
         }
         std::fclose(s);
     }
