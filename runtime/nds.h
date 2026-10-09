@@ -166,6 +166,13 @@ bool gpu2d_top_is_a();                  // POWCNT1 bit 15: engine A on the upper
 extern bool g_2d_on;                    // the engines draw (headless runs: only for a picture's frame)
 // the compositor in software: one pixel's words with the 3D's (RGB666 + alpha in bits 18-22)
 uint32_t gpu2d_compose(const uint32_t* w, uint32_t px3d);   // -> 0xRRGGBB
+// display capture (DISPCAPCNT): the frame after it is enabled, captured into a VRAM bank
+// at the frame's end (line 192), the enable bit then cleared
+void gpu2d_capture();
+uint8_t* vram_bank(int bank);           // a bank's own memory (A-I: 0-8), whatever it is mapped to
+// the 3D picture being shown at the DS's resolution (RGB666, alpha in bits 18-22), rows top
+// first; false without OpenGL (a headless run with no picture: no window, hidden or not)
+bool display_read3d(uint32_t* px);
 
 // ---- the geometry engine (gx.cpp) -----------------------------------------------------
 void gx_reset();

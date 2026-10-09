@@ -451,11 +451,89 @@ static void draw_line(int e, int y) {
 }
 
 bool g_2d_on = true;
+static uint32_t g_cap;                              // DISPCAPCNT as the frame began with it enabled; 0: none
 
 void gpu2d_line(int y) {
-    if (!g_2d_on) return;
+    if (y == 0) {
+        uint32_t cnt = io_reg(9, 0x04000064u);
+        g_cap = cnt >> 31 ? cnt : 0;
+    }
+    if (!g_2d_on && !g_cap) return;                 // a capture needs the lines even when nothing is shown
     draw_line(0, y);
     draw_line(1, y);
+}
+
+// ---- display capture --------------------------------------------------------------------------
+// The frame after DISPCAPCNT's enable bit is set (latched at its line 0) is captured at its end
+// into a VRAM bank (A-D, written directly whatever it is mapped to), from source A (engine A's
+// picture before the master brightness, or the 3D alone), source B (a VRAM bank, the one
+// DISPCNT's display block names, from the read offset) or the two blended by EVA and EVB;
+// 15-bit colour with the alpha bit, lines of the capture's width; then the enable bit clears.
+// The 3D comes from the renderer at the DS's resolution. Main memory display as source B is
+// not done.
+static inline uint16_t c555(uint32_t c666) {
+    return (uint16_t)((c666 >> 1 & 31) | (c666 >> 7 & 31) << 5 | (c666 >> 13 & 31) << 10);
+}
+
+void gpu2d_capture() {
+    uint32_t cnt = g_cap;
+    g_cap = 0;
+    if (!cnt) return;
+    static const int kW[4] = {128, 256, 256, 256}, kH[4] = {128, 64, 128, 192};
+    int size = cnt >> 20 & 3, w = kW[size], h = kH[size];
+    uint32_t eva = cnt & 31, evb = cnt >> 8 & 31;
+    if (eva > 16) eva = 16;
+    if (evb > 16) evb = 16;
+    int src = cnt >> 29 & 3;
+    bool only3d = cnt >> 24 & 1, fifo = cnt >> 25 & 1;
+    uint8_t* dst = vram_bank(cnt >> 16 & 3);
+    uint32_t woff = (cnt >> 18 & 3) * 0x8000u;
+    uint8_t* srcb = vram_bank(reg32(0x04000000u) >> 18 & 3);
+    uint32_t roff = (cnt >> 26 & 3) * 0x8000u;
+    static uint32_t p3[256 * 192];
+    bool have3d = false;
+    if (src != 1) {
+        have3d = display_read3d(p3);
+        if (!have3d) {
+            nds_once("2d", 5, "2D: a display capture without the 3D (no OpenGL in this run)");
+            std::memset(p3, 0, sizeof p3);
+        }
+    }
+    if (src != 0 && fifo) nds_once("2d", 6, "2D: display capture from main memory display is not done");
+    for (int y = 0; y < h; ++y)
+        for (int x = 0; x < w; ++x) {
+            uint16_t a = 0, b = 0;
+            if (src != 1) {
+                uint32_t px = p3[y * 256 + x];
+                if (only3d) {
+                    a = c555(px) | ((px >> 18 & 31) ? 0x8000 : 0);
+                } else {
+                    const uint32_t* wd = g_2d.px[0][y][x];
+                    uint32_t ww[2] = {wd[0], wd[1] & ~(3u << 24)};
+                    uint32_t rgb = gpu2d_compose(ww, px);
+                    a = (uint16_t)((rgb >> 19 & 31) | (rgb >> 11 & 31) << 5 | (rgb >> 3 & 31) << 10 | 0x8000);
+                }
+            }
+            if (src != 0 && !fifo) {
+                uint32_t o = (roff + (uint32_t)(y * 256 + x) * 2) & 0x1FFFF;
+                b = (uint16_t)(srcb[o] | srcb[o + 1] << 8);
+            }
+            uint16_t out = a;
+            if (src == 1) {
+                out = b;
+            } else if (src >= 2) {
+                uint32_t aa = a >> 15, ab = b >> 15;
+                out = (uint16_t)((eva && aa) || (evb && ab) ? 0x8000 : 0);
+                for (int s = 0; s < 15; s += 5) {
+                    uint32_t v = ((a >> s & 31) * eva * aa + (b >> s & 31) * evb * ab + 8) >> 4;
+                    out |= (uint16_t)((v > 31 ? 31 : v) << s);
+                }
+            }
+            uint32_t o = (woff + (uint32_t)(y * w + x) * 2) & 0x1FFFF;
+            dst[o] = (uint8_t)out;
+            dst[o + 1] = (uint8_t)(out >> 8);
+        }
+    io_set16(9, 0x04000066u, io_reg16(9, 0x04000066u) & 0x7FFF);
 }
 
 // ---- the compositor, in software ----------------------------------------------------------------

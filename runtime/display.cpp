@@ -309,6 +309,20 @@ bool display_frame() {
     return true;
 }
 
+bool display_read3d(uint32_t* out) {
+    if (!win) return false;
+    GLuint pic = render_draw(gx_job(), t_one);
+    std::vector<uint8_t> px3d(256 * 192 * 4);
+    glGetTextureImage(pic, 0, GL_RGBA, GL_UNSIGNED_BYTE, (GLsizei)px3d.size(), px3d.data());
+    auto u6 = [](uint8_t v) { return (uint32_t)((v * 63 + 127) / 255); };
+    for (int y = 0; y < 192; ++y)
+        for (int x = 0; x < 256; ++x) {
+            const uint8_t* q = &px3d[((size_t)(191 - y) * 256 + x) * 4];
+            out[y * 256 + x] = u6(q[0]) | u6(q[1]) << 6 | u6(q[2]) << 12 | (uint32_t)((q[3] * 31 + 127) / 255) << 18;
+        }
+    return true;
+}
+
 void display_shot(const std::string& path) {
     if (visible) capture = path.substr(0, path.size() - 4) + "-window.png";
     GLuint pic = render_draw(gx_job(), t_one);

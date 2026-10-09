@@ -22,8 +22,12 @@
 // picture: each pixel's fog flag (POLYGON_ATTR bit 15; a translucent pixel
 // keeps it only where the pixel under it had it) and its depth.
 //
-// Not yet: shadow polygons (mode 3, skipped), the translucent polygon ID
-// rule, the equal depth test, edge marking, anti-aliasing, the clear
+// Shadow polygons (mode 3) through the stencil: a mask (polygon ID 0) marks
+// where it fails the depth test, the shadows then draw, blended, only there;
+// the DS's rule that a shadow skips pixels of its own polygon ID is not
+// followed yet.
+//
+// Not yet: the translucent polygon ID rule, the equal depth test, edge marking, anti-aliasing, the clear
 // image; a translucent pixel over a clear pixel of alpha 0 is blended with
 // the clear colour, where the DS writes it as it is.
 //
@@ -382,16 +386,18 @@ static void draw_polys(const Render3dJob& J, GlTarget& T) {
     }
     // the vertices, in drawing order; runs of the same state are one draw each
     static std::vector<Vtx> vs;
-    struct Run { GLint first; GLsizei n; int kind; };   // kind: 0 opaque, 1 translucent, 2 translucent + depth, 3 lines
+    // kind: 0 opaque, 1 translucent, 2 translucent + depth, 3 lines, 4 shadow mask (ID 0),
+    // 5 shadow (ID 1-63), 6 shadow + depth
+    struct Run { GLint first; GLsizei n; int kind; };
     static std::vector<Run> runs;
     vs.clear();
     runs.clear();
     bool snap = T.scale == 1;
     for (const GxPoly& p : J.polys) {
         uint32_t mode = p.attr >> 4 & 3, alpha = p.attr >> 16 & 31;
-        if (mode == 3) { nds_once("render", 2, "3D: shadow polygons (not drawn)"); continue; }
         if (p.attr & 0x4000) nds_once("render", 3, "3D: the equal depth test (drawn as less)");
         int kind = alpha == 0 ? 3 : !p.translucent ? 0 : (p.attr & 0x800) ? 2 : 1;
+        if (mode == 3 && alpha) kind = (p.attr >> 24 & 63) == 0 ? 4 : (p.attr & 0x800) ? 6 : 5;
         GLint first = (GLint)vs.size();
         auto put = [&](const GxVertex& g) {
             Vtx v;
@@ -436,8 +442,35 @@ static void draw_polys(const Render3dJob& J, GlTarget& T) {
     glBindTextureUnit(1, paltex);
     glEnable(GL_DEPTH_TEST);
     glDepthFunc(GL_LESS);
+    const GLint zero = 0;
+    glClearNamedFramebufferiv(T.fbo, GL_STENCIL, 0, &zero);
+    int last = -1;
     for (const Run& r : runs) {
-        bool blend = (r.kind == 1 || r.kind == 2) && (J.disp3dcnt & 8);
+        // shadows: a mask (polygon ID 0) marks the stencil where it fails the depth test,
+        // drawing nothing; the shadow polygons then draw only where it is marked; a mask
+        // after shadows starts again from a clear stencil
+        if (r.kind == 4) {
+            if (last == 5 || last == 6) glClearNamedFramebufferiv(T.fbo, GL_STENCIL, 0, &zero);
+            glEnable(GL_STENCIL_TEST);
+            glStencilFunc(GL_ALWAYS, 1, 0xFF);
+            glStencilOp(GL_KEEP, GL_REPLACE, GL_KEEP);      // marked where the depth test fails
+            glColorMaski(0, GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE);
+            glColorMaski(1, GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE);
+            glDepthMask(GL_FALSE);
+            glDrawArrays(GL_TRIANGLES, r.first, r.n);
+            glColorMaski(0, GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+            glColorMaski(1, GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+            glDisable(GL_STENCIL_TEST);
+            last = 4;
+            continue;
+        }
+        if (r.kind == 5 || r.kind == 6) {
+            glEnable(GL_STENCIL_TEST);
+            glStencilFunc(GL_EQUAL, 1, 0xFF);
+            glStencilOp(GL_KEEP, GL_KEEP, GL_KEEP);
+        }
+        last = r.kind;
+        bool blend = (r.kind == 1 || r.kind == 2 || r.kind == 5 || r.kind == 6) && (J.disp3dcnt & 8);
         if (blend) {
             // the colour blended, its alpha the greater; the fog flag kept only where both have it
             glEnablei(GL_BLEND, 0);
@@ -450,8 +483,9 @@ static void draw_polys(const Render3dJob& J, GlTarget& T) {
             glDisablei(GL_BLEND, 0);
             glDisablei(GL_BLEND, 1);
         }
-        glDepthMask(r.kind == 1 ? GL_FALSE : GL_TRUE);
+        glDepthMask(r.kind == 1 || r.kind == 5 ? GL_FALSE : GL_TRUE);
         glDrawArrays(r.kind == 3 ? GL_LINES : GL_TRIANGLES, r.first, r.n);
+        if (r.kind == 5 || r.kind == 6) glDisable(GL_STENCIL_TEST);
     }
     glDisablei(GL_BLEND, 0);
     glDisablei(GL_BLEND, 1);

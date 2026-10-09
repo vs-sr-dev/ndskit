@@ -58,6 +58,7 @@ static void line(uint64_t when) {
         gpu2d_line(g_vcount);
     } else if (g_vcount == 192) {
         g_flags |= 1;
+        gpu2d_capture();
         gpu2d_vblank();
         gx_vblank();
         nds_count_vblank();
@@ -80,6 +81,8 @@ static void line(uint64_t when) {
 static uint8_t g_vram[0xA4000];
 static const uint32_t kBankOff[9] = {0x00000, 0x20000, 0x40000, 0x60000, 0x80000, 0x90000, 0x94000, 0x98000, 0xA0000};
 static const uint32_t kBankSize[9] = {0x20000, 0x20000, 0x20000, 0x20000, 0x10000, 0x4000, 0x4000, 0x8000, 0x4000};
+
+uint8_t* vram_bank(int bank) { return g_vram + kBankOff[bank]; }
 static uint8_t g_cnt[9];
 
 const int g_vram_pages[VRAM_NAREAS] = {32, 8, 16, 8, 41, 16, 32, 6, 2, 2, 1, 1};

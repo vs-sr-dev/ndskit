@@ -84,6 +84,7 @@ static void report();
 void nds_fatal(const char* fmt, ...) {
     va_list ap; va_start(ap, fmt); vlog(tag(), fmt, ap); va_end(ap);
     report();
+    cart_save();                                // the player's save is not the fault's: keep it
     std::fflush(stderr);
     std::_Exit(1);
 }

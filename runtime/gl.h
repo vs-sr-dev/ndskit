@@ -22,6 +22,10 @@
     X(PFNGLENABLEIPROC, glEnablei)                                                                  \
     X(PFNGLDISABLEIPROC, glDisablei)                                                                \
     X(PFNGLCLEARNAMEDFRAMEBUFFERFVPROC, glClearNamedFramebufferfv)                                  \
+    X(PFNGLCLEARNAMEDFRAMEBUFFERIVPROC, glClearNamedFramebufferiv)                                  \
+    X(PFNGLSTENCILFUNCPROC, glStencilFunc)                                                          \
+    X(PFNGLSTENCILOPPROC, glStencilOp)                                                              \
+    X(PFNGLCOLORMASKIPROC, glColorMaski)                                                            \
     X(PFNGLNAMEDFRAMEBUFFERDRAWBUFFERSPROC, glNamedFramebufferDrawBuffers)                          \
     X(PFNGLPROGRAMUNIFORM4UIPROC, glProgramUniform4ui)                                              \
     X(PFNGLPOLYGONMODEPROC, glPolygonMode)                                                          \
