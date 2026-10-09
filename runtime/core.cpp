@@ -188,9 +188,24 @@ bool code_matches(const ArmModule* m) {
     return crc == m->code_crc;
 }
 
-void check_slot(Slot& s) {
+bool samples_match(const ArmModule* m) {
+    for (uint32_t i = 0; i < m->nsamples; ++i) {
+        uint32_t w = 0;
+        if (!nds_mem_read(m->cpu, m->samples[2 * i], &w, 4) || w != m->samples[2 * i + 1]) return false;
+    }
+    return true;
+}
+
+// Which overlay the slot holds. `cheap`: memory may have changed (the cartridge
+// delivered data) and the one resident is checked by its samples first; a full
+// check (every candidate's code crc32) when it is not there, or none was.
+void check_slot(Slot& s, bool cheap = false) {
     const ArmModule* was = s.resident;
     const ArmModule* now = nullptr;
+    if (was && cheap && samples_match(was)) {
+        s.epoch = g_arm_overlay_epoch;
+        return;
+    }
     if (was && code_matches(was)) now = was;     // most often still there
     for (size_t i = 0; !now && i < s.cands.size(); ++i)
         if (s.cands[i] != was && code_matches(s.cands[i])) now = s.cands[i];
@@ -216,7 +231,7 @@ uint32_t first_insn(int cpu, uint32_t key) {
 const ArmModule* arm_overlay_resident(int cpu, uint32_t addr) {
     Slot* s = slot_of(cpu, addr);
     if (!s) return nullptr;
-    if (s->epoch != g_arm_overlay_epoch) check_slot(*s);
+    if (s->epoch != g_arm_overlay_epoch) check_slot(*s, true);
     return s->resident;
 }
 
@@ -227,13 +242,14 @@ ArmFunc arm_lookup(int cpu, uint32_t key) {
     if (i >= 0) return m->funcs[i].fn;
     Slot* s = slot_of(cpu, key & ~1u);
     if (!s) return nullptr;
-    if (s->epoch != g_arm_overlay_epoch) check_slot(*s);
+    if (s->epoch != g_arm_overlay_epoch) check_slot(*s, true);
     for (int pass = 0; pass < 2 && s->resident; ++pass) {
         const ArmModule* o = s->resident;
         i = find_func(o, key);
-        if (i < 0) return nullptr;
-        if (first_insn(cpu, key) == o->firsts[i]) return o->funcs[i].fn;
-        check_slot(*s);                          // the bytes are not this overlay's any more
+        if (i >= 0 && first_insn(cpu, key) == o->firsts[i]) return o->funcs[i].fn;
+        if (pass) break;
+        check_slot(*s);                          // not this overlay's entry or bytes: which one is there?
+        if (s->resident == o) break;
     }
     return nullptr;
 }

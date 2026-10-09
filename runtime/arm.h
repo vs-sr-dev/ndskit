@@ -54,12 +54,16 @@ struct ArmModule {
     // An overlay's module (overlay >= 0; its one segment is where it loads, shared
     // with other overlays): resident when the bytes of its code (the ranges, data
     // left out: it changes once loaded) have code_crc; firsts[i] is the first
-    // instruction of funcs[i], checked at each call dispatched into it.
+    // instruction of funcs[i], checked at each call dispatched into it;
+    // samples: (address, word) pairs spread over the code, a cheap check that
+    // the resident overlay is still there after memory may have changed.
     int overlay;
     const ArmRange* code;
     uint32_t ncode;
     uint32_t code_crc;
     const uint32_t* firsts;
+    const uint32_t* samples;
+    uint32_t nsamples;
 };
 
 // A return that went to a landing of the active module, not to the call's

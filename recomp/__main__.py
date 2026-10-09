@@ -229,7 +229,7 @@ class Module:
                            for r in rs})
             if land:
                 f.write("static const uint32_t landings[] = {%s};\n\n" % ", ".join("0x%08Xu" % t for t in land))
-            tail = "-1, nullptr, 0, 0, nullptr"
+            tail = "-1, nullptr, 0, 0, nullptr, nullptr, 0"
             if self.overlay is not None:
                 ranges = self.code_ranges()
                 crc, s = 0, self.overlay[1]
@@ -239,7 +239,11 @@ class Module:
                     "    {0x%08Xu, 0x%Xu},\n" % (lo, hi - lo) for lo, hi in ranges))
                 f.write("static const uint32_t firsts[] = {\n%s};\n\n" % "".join(
                     "    0x%08Xu,\n" % (mem.u16(k & ~1) if k & 1 else mem.u32(k)) for k in keys))
-                tail = "%d, code, %d, 0x%08Xu, firsts" % (self.overlay[0], len(ranges), crc)
+                words = [a for lo, hi in ranges for a in range((lo + 3) & ~3, hi - 3, 4)]
+                pick = [words[i * len(words) // 64] for i in range(min(64, len(words)))]
+                f.write("static const uint32_t samples[] = {\n%s};\n\n" % "".join(
+                    "    0x%08Xu, 0x%08Xu,\n" % (a, mem.u32(a)) for a in pick))
+                tail = "%d, code, %d, 0x%08Xu, firsts, samples, %d" % (self.overlay[0], len(ranges), crc, len(pick))
             f.write('extern const ArmModule module = {"%s", %d, segs, %d, funcs, %d, %s, %d, %s};\n'
                     % (self.name, self.cpu, len(segs), len(keys), "landings" if land else "nullptr",
                        len(land), tail))
