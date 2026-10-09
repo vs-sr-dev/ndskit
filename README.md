@@ -25,9 +25,10 @@ knowledge. Game formats and game fixes live in the ports.
 
 ## Using it
 
-ndskit is born inside its first port (`pc-moon/ndskit/`); it will move to
-its own repository and be taken by each port as a git submodule at
-`ndskit/`, so that `python -m ndskit.…` works from the port's root.
+ndskit was born inside its first port and was split out of it with its
+history. Each port takes it as a git submodule at `ndskit/` (`git clone
+--recursive`, or `git submodule update --init` after a clone), so that
+`python -m ndskit.…` works from the port's root.
 
 ```sh
 python -m ndskit.rom GAME.nds --info                 # header, CRCs, programs, autoloads, SDK, banner
