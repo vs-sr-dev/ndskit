@@ -32,6 +32,7 @@ through registers, conditional returns, mode switches with their banked
 registers, an exception return).
 """
 import argparse
+import copy
 import os
 import random
 import struct
@@ -801,6 +802,7 @@ def main(argv=None):
     ap.add_argument("--auto", action="store_true", help="also every function that runs alone")
     ap.add_argument("--vectors", type=int, default=16)
     ap.add_argument("--seed", type=int, default=1)
+    ap.add_argument("--overlay", type=lambda x: int(x, 0), help="an overlay's functions, with it loaded")
     ap.add_argument("--out")
     a = ap.parse_args(argv)
     if a.optest:
@@ -810,14 +812,25 @@ def main(argv=None):
     from ..rom import Rom
     with open(a.rom, "rb") as fh:
         rom = Rom(fh.read())
-    segs, entry = discover.segments_from_rom(rom, a.cpu)
+    segs, entry = discover.segments_from_rom(rom, a.cpu, a.overlay)
     mem0 = discover.Memory(segs, arch=5 if a.cpu == 9 else 4)
-    prog = discover.Program(mem0, [entry]).run()
+    seeds = [entry]
+    if a.overlay is not None:
+        seeds += discover.overlay_seeds(rom, a.cpu, a.overlay, mem0)
+    prog = discover.Program(mem0, seeds).run()
+    tested = prog
+    if a.overlay is not None:
+        # the overlay's functions only, run with the program's module active: calls
+        # into the overlay go through the runtime's choice of the resident overlay
+        oseg = segs[-1]
+        tested = copy.copy(prog)
+        tested.funcs = {e: f for e, f in prog.funcs.items() if oseg.base <= e < oseg.end}
     out_dir = os.path.dirname(os.path.abspath(a.out))
     images = [(s.data, s.base) for s in segs]
     data = scratch_data(a.seed)
     images.append((data, SCRATCH))
-    name = "ARM%d" % a.cpu
+    module = "ARM%d" % a.cpu
+    name = module if a.overlay is None else "%s_OV%d" % (module, a.overlay)
     lines = ["# ndskit self-test: %s" % name, "cpu %d" % a.cpu]
     for i, s in enumerate(segs):
         path = os.path.join(out_dir, "%s_seg%d.bin" % (name.lower(), i)).replace("\\", "/")
@@ -828,14 +841,14 @@ def main(argv=None):
     with open(scratch, "wb") as f:
         f.write(data)
     lines.append("image %08X %s" % (SCRATCH, scratch))
-    lines.append("module %s" % name)
+    lines.append("module %s" % module)
     rng = random.Random(a.seed)
     funcs = {int(x, 16): "game" for x in a.funcs.split(",") if x}
     if a.auto:
-        found = pure_functions(a.cpu, images, prog, rng)
+        found = pure_functions(a.cpu, images, tested, rng)
         n_args = sum(1 for m in found.values() if m == "args")
         print("%s: %d of %d functions run on their stack alone, %d more with pointer arguments"
-              % (name, len(found) - n_args, len(prog.funcs), n_args))
+              % (name, len(found) - n_args, len(tested.funcs), n_args))
         for k, mode in found.items():
             funcs.setdefault(k, mode)
     mem = new_memory(a.cpu, images)

@@ -131,14 +131,16 @@ class Body:
     """One discovered function as C++.
 
     `prog`: the discover.Program; `entries`: {key: thumb} of every entry of
-    this program (key = address | thumb); `volatile`: literal-pool slots not
+    this program (key = address | thumb), and `names` the qualified C++ names
+    of those that are another module's (an overlay calling its program); `volatile`: literal-pool slots not
     to fold into constants; `arch`: 5 (ARM9) or 4 (ARM7). After emit():
     `sites` counts the calls and jumps through registers by how they were
     resolved, `unknown` lists static targets that are not entries.
     """
 
-    def __init__(self, prog, f, entries, volatile=frozenset(), arch=5, comments=True):
+    def __init__(self, prog, f, entries, volatile=frozenset(), arch=5, comments=True, names=None):
         self.p, self.f, self.mem = prog, f, prog.mem
+        self.names = names or {}
         self.thumb, self.T = f.thumb, int(f.thumb)
         self.entries, self.volatile, self.arch, self.comments = entries, volatile, arch, comments
         self.ops = {a: self.mem.insn(a, f.thumb) for a in f.code}
@@ -587,13 +589,17 @@ class Body:
     def _tail(self, key):
         """Leave for `key` (address | thumb), a static target outside this function's code."""
         if key in self.entries:
-            return "%s(c); return;" % fname(key & ~1, key & 1)
+            return "%s(c); return;" % self._fn(key)
         self.unknown.append(key)
         return "arm_jump(c, %s); return;" % _h(key)
 
+    def _fn(self, key):
+        """The C++ name of an entry: this module's, or another's (`names`)."""
+        return self.names.get(key) or fname(key & ~1, key & 1)
+
     def _call(self, key):
         if key in self.entries:
-            return "%s(c);" % fname(key & ~1, key & 1)
+            return "%s(c);" % self._fn(key)
         self.unknown.append(key)
         return "arm_call(c, %s);" % _h(key)
 
@@ -606,7 +612,7 @@ class Body:
         if k not in self.entries:
             self.unknown.append(k)
             return "arm_call(c, x);"
-        return "if (x == %s) %s(c); else arm_call(c, x);" % (_h(k), fname(k & ~1, k & 1))
+        return "if (x == %s) %s(c); else arm_call(c, x);" % (_h(k), self._fn(k))
 
     def _unwind(self, call):
         """A call and its return check, in a function holding landings (the
@@ -734,7 +740,7 @@ class Body:
                 return "{ %s%s }" % (pre, self._goto(k & ~1, a)), False
             if k in self.entries:
                 return ("{ %sconst uint32_t x = %s; if (x == %s) %s(c); else arm_jump(c, x); %s }"
-                        % (pre, key, _h(k), fname(k & ~1, k & 1), self._back())), False
+                        % (pre, key, _h(k), self._fn(k), self._back())), False
         self.sites["unresolved jump"] = self.sites.get("unresolved jump", 0) + 1
         return "{ %sarm_jump(c, %s); %s }" % (pre, key, self._back()), False
 

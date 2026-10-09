@@ -380,6 +380,10 @@ void arm_bad_return(ArmContext& c, uint32_t expected) {
     nds_fatal("ARM%d returned to %08X, expected %08X", c.cpu, c.pc, expected);
 }
 
+void arm_overlay_changed(int cpu, uint32_t base, const ArmModule* now) {
+    nds_note("ARM%d: the overlay area %08X holds %s", cpu, base, now ? now->name : "none of this build's overlays");
+}
+
 // A call to code the modules do not have. If it is code the program copied
 // there from its own image, say where from: the recompiler takes it with --copy.
 void arm_call_unknown(ArmContext& c, uint32_t key) {
@@ -391,7 +395,7 @@ void arm_call_unknown(ArmContext& c, uint32_t key) {
             if (mod->cpu != c.cpu) continue;
             for (uint32_t s = 0; s < mod->nsegs; ++s) {
                 const ArmSegment& g = mod->segs[s];
-                if (g.copied || (a - g.base) < g.size) continue;
+                if (g.kind != ARM_SEG_PROGRAM || (a - g.base) < g.size) continue;
                 std::vector<uint8_t> img(g.size);
                 if (!nds_mem_read(c.cpu, g.base, img.data(), g.size)) continue;
                 for (uint32_t o = 0; o + sizeof here <= g.size; o += 2)
@@ -545,7 +549,7 @@ static void dump() {
 static const ArmModule* find_module(int cpu) {
     for (int i = 0; i < g_arm_nmodules; ++i) {
         const ArmModule* m = g_arm_modules[i];
-        if (m->cpu != cpu || !m->nsegs) continue;
+        if (m->cpu != cpu || !m->nsegs || m->overlay >= 0) continue;
         const ArmSegment& s = m->segs[0];          // the block at its load address: the autoloads are not in place yet
         std::vector<uint8_t> buf(s.size);
         if (nds_mem_read(cpu, s.base, buf.data(), s.size) && nds_crc32(buf.data(), s.size) == s.crc) return m;

@@ -39,7 +39,9 @@ typedef void (*ArmFunc)(ArmContext&);
 // they run (to recognise them), and its entries sorted by key (the address,
 // bit 0 set for Thumb).
 struct ArmFuncEntry { uint32_t key; ArmFunc fn; };
-struct ArmSegment { uint32_t base, size, crc, copied; };   // copied: put there by the program at run time
+enum { ARM_SEG_PROGRAM = 0, ARM_SEG_COPIED = 1, ARM_SEG_OVERLAY = 2 };
+struct ArmSegment { uint32_t base, size, crc, kind; };    // kind: ARM_SEG_*; copied: put there at run time
+struct ArmRange { uint32_t base, size; };
 struct ArmModule {
     const char* name;
     int cpu;
@@ -49,6 +51,15 @@ struct ArmModule {
     uint32_t nfuncs;
     const uint32_t* landings;           // return addresses of calls to a context save (sorted keys)
     uint32_t nlandings;
+    // An overlay's module (overlay >= 0; its one segment is where it loads, shared
+    // with other overlays): resident when the bytes of its code (the ranges, data
+    // left out: it changes once loaded) have code_crc; firsts[i] is the first
+    // instruction of funcs[i], checked at each call dispatched into it.
+    int overlay;
+    const ArmRange* code;
+    uint32_t ncode;
+    uint32_t code_crc;
+    const uint32_t* firsts;
 };
 
 // A return that went to a landing of the active module, not to the call's
@@ -265,3 +276,10 @@ void    arm_activate(const ArmModule* m);                // the one module of it
 ArmFunc arm_lookup(int cpu, uint32_t key);               // nullptr if not an entry
 bool    arm_is_landing(int cpu, uint32_t key);           // a landing of the active module
 uint32_t nds_crc32(const uint8_t* p, size_t n, uint32_t crc = 0);
+// Overlays: an address in an overlay's load area is looked up in the module of the
+// overlay resident there, found by its code's crc32 and checked again whenever
+// memory may have changed under it (the epoch: the cartridge bumps it with every
+// word it delivers) or a dispatched call's first instruction is not the module's.
+extern uint32_t g_arm_overlay_epoch;
+const ArmModule* arm_overlay_resident(int cpu, uint32_t addr);  // nullptr: none of the build's
+void    arm_overlay_changed(int cpu, uint32_t base, const ArmModule* now);  // services: a slot changed hands

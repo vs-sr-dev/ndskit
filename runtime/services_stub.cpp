@@ -51,3 +51,4 @@ void nds_mmio_write(int cpu, uint32_t a, uint32_t v, int size) {
 int g_arm_trace;
 void nds_watch_hit(int cpu, uint32_t a, uint32_t v, int size) { (void)cpu; (void)a; (void)v; (void)size; }
 void arm_trace_enter(ArmContext& c, uint32_t key) { (void)c; (void)key; }
+void arm_overlay_changed(int cpu, uint32_t base, const ArmModule* now) { (void)cpu; (void)base; (void)now; }
