@@ -22,9 +22,9 @@
 // busy bit cleared. The samples come through a FIFO as the hardware's do: 32
 // bytes fetched as the channel starts, 16 more each time it is down to 16.
 // A stream refilled behind the play position counts on that read-ahead
-// (Moon's movies rewrite each 256-byte block of their ring buffer the
-// moment the play position leaves it: read at the moment of playing, the
-// block's last samples were already the next lap's).
+// (a movie player met in 2026 rewrites each block of its ring buffer as
+// soon as a timer says the block is played, 3 samples before the channel
+// has played it: read at the moment of playing, those were the next lap's).
 //
 // The mix, in integers at the hardware's widths (GBATEK; melonDS's
 // arithmetic): a channel's sample times 16 >> the divider's shift (0, 1, 2,
