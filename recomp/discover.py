@@ -265,6 +265,12 @@ class Program:
         self.seeds = [(a & ~1, bool(a & 1)) if isinstance(a, int) else a for a in seeds]
         self.entries = {}          # address -> thumb, every known entry
         self.crossing = set()      # (address, thumb) reached in an overlay from outside it
+        self.foreign = set()       # the same, found by another overlay's run (a stricter test)
+        self.areas = []            # (lo, hi): other overlays' areas, not loaded in this run
+
+    def _elsewhere(self, a):
+        """a lies in another overlay's area, its code not loaded here."""
+        return not self.mem.inside(a) and any(lo <= a < hi for lo, hi in self.areas)
 
     # ---- one function -------------------------------------------------
     def _consts_step(self, regs, ins):
@@ -714,11 +720,15 @@ class Program:
         instruction, nothing already walked); otherwise they are meant for
         another overlay loaded at the same address."""
         out = set()
-        for a, thumb in self.crossing:
+        for a, thumb in self.crossing | self.foreign:
             if a in self.entries:
                 continue
             ins = self.mem.insn(a, thumb)
-            if ins is not None and ins.cond == 14 and self._clean_descent(a, thumb, 1):
+            if ins is None or ins.cond != 14:
+                continue
+            if (a, thumb) not in self.crossing and not (_is_prologue(ins, self.mem) or self._boundary(a, thumb)):
+                continue        # from another overlay's run: it must also start where a function would
+            if self._clean_descent(a, thumb, 1):
                 out.add((a, thumb))
         return out
 
@@ -731,7 +741,7 @@ class Program:
         self.entries = saved
         if f.conflicts or len(f.code) < 2 or any(c in self.code for c in f.code):
             return False
-        return any(t in self.entries for t, _ in f.tails)
+        return any(t in self.entries or self._elsewhere(t) for t, _ in f.tails)
 
     def _data_words(self):
         """Word-aligned addresses that are data or unclassified, inside the segments."""
@@ -813,7 +823,9 @@ class Program:
     def _boundary(self, a, thumb):
         """a follows data, or the last instruction of code that does not run on;
         or, unclassified, a word that is a return (`bx lr`, `pop {..., pc}`),
-        or the literal pool of such a return (`ldr r0, [pc]; bx lr; .word k`):
+        or the literal pool (a few words, loaded by the code just before) of any
+        unconditional transfer that is not a call (`ldr r0, [pc]; bx lr; .word k`,
+        a veneer's `ldr r12, [pc]; bx r12; .word f`):
         the end of an unreached function (tiny virtual methods sit in a row)."""
         prev = a - (2 if thumb else 4)
         if prev in self.data:
@@ -823,17 +835,23 @@ class Program:
             return pi is not None and pi.writes_pc and pi.cond == 14 and not pi.is_call
         if self._ret(pi):
             return True
-        if thumb:
-            return False
-        for n in (1, 2):                      # a pool of one or two words after a return
+        return not thumb and self._after_pool(a)
+
+    def _after_pool(self, a):
+        """a follows a literal pool of a few words (each one loaded by the code just
+        before it) that follows an unconditional transfer: a function's end."""
+        for n in (1, 2, 3, 4):
             pool = a - 4 * n
             ri = self.mem.insn(pool - 4, False)
-            if pool - 4 in self.code or not self._ret(ri):
+            if pool - 4 in self.code or not self._ends(ri):
                 continue
-            for b in range(pool - 16, pool - 4, 4):
+            loaded = set()
+            for b in range(pool - 64, pool - 4, 4):
                 li = self.mem.insn(b, False)
-                if li is not None and li.literal_size and li.target is not None and pool <= li.target < a:
-                    return True
+                if li is not None and li.literal_size == 4 and li.target is not None:
+                    loaded.add(li.target)
+            if all(w in loaded for w in range(pool, a, 4)):
+                return True
         return False
 
     def _fills_gap(self, a, thumb):
@@ -860,6 +878,14 @@ class Program:
             b += step
         return False
 
+    @classmethod
+    def _ends(cls, pi):
+        """An instruction after which a function's code does not run on: a return,
+        or any unconditional transfer that is not a call (a veneer's `bx r12`)."""
+        if cls._ret(pi):
+            return True
+        return pi is not None and pi.cond == 14 and not pi.is_call and (pi.writes_pc or pi.op == "b")
+
     @staticmethod
     def _ret(pi):
         if pi is None or pi.cond != 14:
@@ -880,6 +906,8 @@ class Program:
                     near.append(p + sign * step)
         for q in near:
             v = self.mem.u32(q)
+            if v is not None and ((v & 1) or not v & 3) and self._elsewhere(v & ~1):
+                return True         # a method inherited from another overlay's class (a vtable)
             if v is not None and self.mem.inside(v & ~1, 2) and ((v & 1) or not v & 3):
                 ins = self.mem.insn(v & ~1, bool(v & 1))
                 if ins is not None and (_is_prologue(ins) or (v & ~1) in self.entries
@@ -911,12 +939,12 @@ class Program:
                 if a in self.code or a in self.entries:
                     continue
                 prev = a - 4
-                if not (prev in self.data or prev in self.code):
-                    continue
                 if prev in self.code:
                     pi = self.mem.insn(prev, False)
                     if pi is None or not (pi.writes_pc and pi.cond == 14 and not pi.is_call):
                         continue
+                elif prev not in self.data and not self._after_pool(a):
+                    continue                # after data, the end of code, or an end's literal pool
                 ins = self.mem.insn(a, False)
                 if _is_prologue(ins, self.mem) and self._clean_descent(a, False):
                     out.add((a, False))
@@ -982,6 +1010,19 @@ def overlay_data(rom, o):
     return blz_decompress(d) if o.compressed else d[:o.ram_size]
 
 
+def overlay_areas(rom, cpu, oid):
+    """The areas of the overlays that do not share overlay oid's: code a run with
+    oid loaded may reach (an inherited method, a veneer) but cannot see."""
+    o = overlay_of(rom, cpu, oid)
+    lo, hi = o.ram, o.ram + o.ram_size
+    out = []
+    for p in (rom.overlays9 if cpu == 9 else rom.overlays7):
+        a, b = p.ram, p.ram + p.ram_size
+        if b <= lo or a >= hi:
+            out.append((a, b))
+    return out
+
+
 def overlay_seeds(rom, cpu, oid, mem):
     """An overlay's static initialisers: the pointers between its sinit start and end."""
     o = overlay_of(rom, cpu, oid)
@@ -1029,7 +1070,10 @@ def main(argv=None):
         if oid is not None:
             seeds += overlay_seeds(rom, a.cpu, oid, mem)
             print("overlay %d:" % oid)
-        prog = Program(mem, seeds).run()
+        prog = Program(mem, seeds)
+        if oid is not None:
+            prog.areas = overlay_areas(rom, a.cpu, oid)
+        prog = prog.run()
         text, conf, unres = prog.summary()
         print(text)
         if oid is not None:

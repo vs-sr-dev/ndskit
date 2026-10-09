@@ -817,7 +817,10 @@ def main(argv=None):
     seeds = [entry]
     if a.overlay is not None:
         seeds += discover.overlay_seeds(rom, a.cpu, a.overlay, mem0)
-    prog = discover.Program(mem0, seeds).run()
+    prog = discover.Program(mem0, seeds)
+    if a.overlay is not None:
+        prog.areas = discover.overlay_areas(rom, a.cpu, a.overlay)
+    prog = prog.run()
     tested = prog
     if a.overlay is not None:
         # the overlay's functions only, run with the program's module active: calls

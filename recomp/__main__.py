@@ -340,15 +340,61 @@ def program_specs(rom, cpu, segs, seeds, overlays, log=print):
     if not overlays:
         return [(name, segs, cpu, seeds)]
     arch = 5 if cpu == 9 else 4
-    runs, program = [], set()
+
+    def discover_one(o, oseg, extra=()):
+        mem = discover.Memory(segs + [oseg], arch=arch)
+        prog = discover.Program(mem, seeds + discover.overlay_seeds(rom, cpu, o.id, mem))
+        prog.foreign |= set(extra)           # taken where they walk clean and start as a function would
+        prog.areas = discover.overlay_areas(rom, cpu, o.id)
+        return prog.run()
+
+    segments = {o.id: discover.Segment(o.ram, discover.overlay_data(rom, o), "ov%d" % o.id, o.id)
+                for o in overlays}
+    progs = {}
     for o in overlays:
         t = time.time()
-        oseg = discover.Segment(o.ram, discover.overlay_data(rom, o), "ov%d" % o.id, o.id)
-        mem = discover.Memory(segs + [oseg], arch=arch)
-        prog = discover.Program(mem, seeds + discover.overlay_seeds(rom, cpu, o.id, mem)).run()
+        progs[o.id] = discover_one(o, segments[o.id])
+        oseg = segments[o.id]
+        log("overlay %d: %d functions discovered with the program  %.1f s"
+            % (o.id, sum(1 for e in progs[o.id].funcs if oseg.base <= e < oseg.end), time.time() - t))
+    # an overlay calling into another slot's overlay (a battle's calling the
+    # field's): the targets, outside that run's memory, seed the overlays of
+    # that area again, each taking those that walk clean in it
+    extra = {}
+
+    def foreign(o, c, ct):
+        for p in overlays:
+            s = segments[p.id]
+            if p.id != o.id and s.base <= c < s.end:
+                extra.setdefault(p.id, set()).add((c, ct))
+
+    for o in overlays:
+        oseg, prog = segments[o.id], progs[o.id]
+        for e, f in prog.funcs.items():
+            if not oseg.base <= e < oseg.end:
+                continue
+            for c, ct in f.calls | f.tails:
+                if not prog.mem.inside(c):
+                    foreign(o, c, ct)
+        # pointers in the overlay's data and literal pools (a vtable of a class whose
+        # methods another overlay holds, a callback): code addresses there too
+        for a in range(oseg.base, oseg.end - 3, 4):
+            if a in prog.code:
+                continue
+            v = prog.mem.u32(a)
+            if v and (v & 1 or not v & 3) and not prog.mem.inside(v & ~1):
+                foreign(o, v & ~1, bool(v & 1))
+    for pid, targets in sorted(extra.items()):
+        p = next(x for x in overlays if x.id == pid)
+        t = time.time()
+        progs[pid] = discover_one(p, segments[pid], targets)
+        log("overlay %d: discovered again with %d targets other overlays call  %.1f s"
+            % (pid, len(targets), time.time() - t))
+    runs, program = [], set()
+    for o in overlays:
+        oseg, prog = segments[o.id], progs[o.id]
         mine = [e for e in prog.funcs if oseg.base <= e < oseg.end]
         program |= {e | int(f.thumb) for e, f in prog.funcs.items() if not oseg.base <= e < oseg.end}
-        log("overlay %d: %d functions discovered with the program  %.1f s" % (o.id, len(mine), time.time() - t))
         if mine:
             runs.append((o, oseg, prog))
     out = [(name, segs, cpu, sorted(set(seeds) | program))]
