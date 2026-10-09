@@ -1,6 +1,7 @@
 """Function discovery for DS programs without symbols (ARM and Thumb).
 
     python -m ndskit.recomp.discover GAME.nds --cpu 9 [--seeds a,b,..] [--report] [--out funcs.tsv]
+    python -m ndskit.recomp.discover GAME.nds --cpu 9 --overlay all --out "funcs_{id}.tsv"
     python -m ndskit.recomp.discover FILE.bin --base 02000000 [--entry 02000800] ...
 
 A DS program is a flat image whose code, literal pools, switch tables and
@@ -80,7 +81,20 @@ output (the compiler of NitroSDK games) and the SDK's hand-written parts:
    end or a literal pool that open with a prologue are taken the same way
    (the linker places whole object files, so uncalled functions sit
    between called ones). Repeat to a fixed point.
-8. Context saves: a function that stores an address of its own code to
+   A trial descent (for a pointer, a prologue or a crossing) that runs
+   into a literal it loads itself is refused: an odd pointer to a string
+   passed to a formatter has two marks and decodes as Thumb for a while.
+8. Overlays (`--overlay N`, or `all` one at a time): the program with
+   overlay N loaded at its address as a segment of its own, its static
+   initialisers (the pointers between its sinit start and end) as seeds.
+   Other overlays share those addresses, so a call or a jump into the
+   overlay from outside it (the main program's direct calls into an
+   overlay's region) is not followed blindly: it is an entry only if its
+   descent there is clean, and otherwise meant for another overlay. The
+   program's own functions are the union over the runs (`--out` with
+   `{id}`: one file per overlay with its functions, and `main` with the
+   program's, those only overlays reach included).
+9. Context saves: a function that stores an address of its own code to
    memory returns twice (NitroSDK's OS_SaveContext); the return addresses
    of the calls to it are landings, where a context loaded later comes
    back (`returns_twice`, `landings`; the recompiler unwinds to them).
@@ -105,7 +119,15 @@ Known gaps: CodeWarrior's Thumb switches (`add pc, rI` after a `lsl`;
 a Thumb-heavy 2008 cartridge leaves half its ARM9 unclassified), and the
 switches through tables of halfword offsets in a newer SDK's ARM7 (`cmp
 rI, #N; bhi default; add rI, pc, rI, lsl #1; ldrh rI, [rI, #4]; add pc,
-pc, rI`).
+pc, rI`). Overlays that the game compresses itself (the overlay table's
+flag clear, the file in a format of the game's) are read as they are
+stored.
+
+Checked with overlays on a 2009 cartridge (14 ARM9 overlays in two
+slots, 117 direct calls from the main program into them): 0 conflicts in
+each; the program's functions, with those only overlays reach, cover
+every function of Ghidra's that is reachable (4 090 of 4 101; the 11 left
+a cluster of dead code that only calls itself).
 """
 import argparse
 import bisect
@@ -116,8 +138,9 @@ from .. import arm
 
 
 class Segment:
-    def __init__(self, base, data, name=""):
+    def __init__(self, base, data, name="", overlay=None):
         self.base, self.data, self.name = base, data, name
+        self.overlay = overlay      # an overlay's id: other overlays share its addresses
         self.end = base + len(data)
         self.img = arm.Image(data, base)
 
@@ -142,6 +165,12 @@ class Memory:
     def inside(self, a, n=1):
         s = self.seg(a)
         return s is not None and a + n <= s.end
+
+    def crosses(self, frm, to):
+        """to lies in an overlay and frm outside it: what frm's code reaches there
+        may be another overlay's, loaded at the same address."""
+        s = self.seg(to)
+        return s is not None and s.overlay is not None and self.seg(frm) is not s
 
     def u32(self, a):
         s = self.seg(a)
@@ -230,6 +259,7 @@ class Program:
         self.literal_loaded = set()    # values loaded by code from literal pools
         self.seeds = [(a & ~1, bool(a & 1)) if isinstance(a, int) else a for a in seeds]
         self.entries = {}          # address -> thumb, every known entry
+        self.crossing = set()      # (address, thumb) reached in an overlay from outside it
 
     # ---- one function -------------------------------------------------
     def _consts_step(self, regs, ins):
@@ -300,6 +330,7 @@ class Program:
         todo = [(f.entry, {})]
         seen = set()
         targets, ruled = {f.entry}, []
+        own = set()         # the bytes this descent loads as literals
         while todo:
             pc, regs = todo.pop()
             regs = dict(regs)
@@ -310,6 +341,9 @@ class Program:
                     break
                 if pc != f.entry and self.entries.get(pc) == thumb:
                     f.tails.add((pc, thumb))
+                    break
+                if mem.crosses(f.entry, pc):
+                    f.tails.add((pc, thumb))    # into an overlay: an entry there only if it walks clean
                     break
                 ins = mem.insn(pc, thumb)
                 if ins is None:
@@ -325,6 +359,7 @@ class Program:
                 f.code.add(pc)
                 lit = ins.literal_size
                 if lit:
+                    own.update(range(ins.target, ins.target + lit))
                     if commit:
                         self.data.update(range(ins.target, ins.target + lit))
                     if lit == 4:
@@ -433,6 +468,13 @@ class Program:
                     continue
                 break
         f.size = sum(mem.insn(a, thumb).size for a in f.code)
+        if not commit:
+            # a trial descent marks no data, so its own literals are checked here:
+            # code that loads its own instructions as literals is data read as code
+            # (a string whose address is odd, taken for a Thumb entry)
+            hit = [c for c in f.code if any(b in own for b in range(c, c + (2 if thumb else 4)))]
+            if hit:
+                f.conflicts.append((min(hit), "runs into its own literal"))
         return {a for path in ruled for a in path if a in targets}
 
     def _lr_set(self, pc, thumb):
@@ -579,7 +621,9 @@ class Program:
             self._walk(f, commit)
             self.funcs[a] = f
             for (c, ct) in f.calls | f.tails:
-                if self.mem.inside(c) and c not in self.entries:
+                if self.mem.crosses(a, c):
+                    self.crossing.add((c, ct))
+                elif self.mem.inside(c) and c not in self.entries:
                     self.entries[c] = ct
                     work.append((c, ct))
 
@@ -599,7 +643,7 @@ class Program:
             for f in self.funcs.values():
                 for a in f.code:
                     self.code[a] = 2 if f.thumb else 4
-            new = self._pointer_seeds() | self._prologue_seeds()
+            new = self._pointer_seeds() | self._prologue_seeds() | self._crossing_seeds()
             new = {(a, t) for a, t in new if a not in self.entries}
             if not new or len(self.entries) == last:
                 break
@@ -658,6 +702,20 @@ class Program:
         if any(c in self.code for c in f.code):
             return False
         return True
+
+    def _crossing_seeds(self):
+        """Calls and jumps into an overlay from outside it: an entry when its
+        descent there is clean (no condition first, no data, no undefined
+        instruction, nothing already walked); otherwise they are meant for
+        another overlay loaded at the same address."""
+        out = set()
+        for a, thumb in self.crossing:
+            if a in self.entries:
+                continue
+            ins = self.mem.insn(a, thumb)
+            if ins is not None and ins.cond == 14 and self._clean_descent(a, thumb, 1):
+                out.add((a, thumb))
+        return out
 
     def _veneer(self, a, thumb):
         """A short clean descent that ends in a jump to a known entry: an
@@ -820,20 +878,50 @@ class Program:
         return "\n".join(lines), conf, unres
 
 
-def segments_from_rom(rom, cpu):
-    """The program of one CPU of a cartridge, as segments at their run addresses."""
+def segments_from_rom(rom, cpu, overlay=None):
+    """The program of one CPU of a cartridge, as segments at their run addresses;
+    with one of its overlays loaded, if given (its id)."""
     code = rom.arm9 if cpu == 9 else rom.arm7
     params = rom.params if cpu == 9 else rom.params7
     data = code.plain
     if params is None:
-        return [Segment(code.ram, data, "main")], code.entry
-    end = params.autoload_start - code.ram
-    segs = [Segment(code.ram, data[:end], "main")]
-    from ..hw import name
-    for addr, size, bss, src in params.autoloads:
-        blk = data[src - code.ram:src - code.ram + size]
-        segs.append(Segment(addr, blk, (name(addr, cpu) or "%08X" % addr).split()[0]))
+        segs = [Segment(code.ram, data, "main")]
+    else:
+        end = params.autoload_start - code.ram
+        segs = [Segment(code.ram, data[:end], "main")]
+        from ..hw import name
+        for addr, size, bss, src in params.autoloads:
+            blk = data[src - code.ram:src - code.ram + size]
+            segs.append(Segment(addr, blk, (name(addr, cpu) or "%08X" % addr).split()[0]))
+    if overlay is not None:
+        o = overlay_of(rom, cpu, overlay)
+        segs.append(Segment(o.ram, overlay_data(rom, o), "ov%d" % o.id, o.id))
     return segs, code.entry
+
+
+def overlay_of(rom, cpu, oid):
+    for o in (rom.overlays9 if cpu == 9 else rom.overlays7):
+        if o.id == oid:
+            return o
+    raise ValueError("no overlay %d on the ARM%d" % (oid, cpu))
+
+
+def overlay_data(rom, o):
+    """An overlay's code as it is loaded (the SDK's backward LZ undone)."""
+    from ..rom import blz_decompress
+    d = rom.file(o.file_id)
+    return blz_decompress(d) if o.compressed else d[:o.ram_size]
+
+
+def overlay_seeds(rom, cpu, oid, mem):
+    """An overlay's static initialisers: the pointers between its sinit start and end."""
+    o = overlay_of(rom, cpu, oid)
+    out = []
+    for a in range(o.sinit_start, o.sinit_end, 4):
+        v = mem.u32(a)
+        if v and mem.inside(v & ~1, 2):
+            out.append(v)
+    return out
 
 
 def main(argv=None):
@@ -843,32 +931,64 @@ def main(argv=None):
     ap.add_argument("--base", help="flat binary: load address (hex)")
     ap.add_argument("--entry", help="flat binary: entry (hex; default the base)")
     ap.add_argument("--seeds", default="", help="more entries, hex, comma-separated (odd = Thumb)")
+    ap.add_argument("--overlay", help="with the program, this overlay loaded (its id), or 'all' one at a time; "
+                                      "--out then lists the overlay's functions only (OUT may hold {id})")
     ap.add_argument("--report", action="store_true", help="list conflicts and unresolved jumps")
     ap.add_argument("--out", help="write ENTRY<TAB>SIZE<TAB>A|T for every function")
     a = ap.parse_args(argv)
     with open(a.file, "rb") as fh:
         raw = fh.read()
+    rom = None
     if a.base is None:
         from ..rom import Rom
-        segs, entry = segments_from_rom(Rom(raw), a.cpu)
+        rom = Rom(raw)
+    if a.overlay is None:
+        overlays = [None]
+    elif a.overlay == "all":
+        overlays = [o.id for o in (rom.overlays9 if a.cpu == 9 else rom.overlays7)]
     else:
-        base = int(a.base, 16)
-        segs, entry = [Segment(base, raw, "main")], int(a.entry or a.base, 16)
-    mem = Memory(segs, arch=5 if a.cpu == 9 else 4)
-    seeds = [entry] + [int(x, 16) for x in a.seeds.split(",") if x]
-    prog = Program(mem, seeds).run()
-    text, conf, unres = prog.summary()
-    print(text)
-    if a.report:
-        for e, (at, why) in conf[:200]:
-            print("conflict  %08X in %08X: %s" % (at, e, why))
-        for e, (at, what) in unres[:400]:
-            print("unresolved %08X in %08X: %s" % (at, e, what))
-    if a.out:
-        with open(a.out, "w") as fh:
-            for e in sorted(prog.funcs):
-                f = prog.funcs[e]
+        overlays = [int(a.overlay, 0)]
+    program = {}
+    for oid in overlays:
+        if rom is not None:
+            segs, entry = segments_from_rom(rom, a.cpu, oid)
+        else:
+            base = int(a.base, 16)
+            segs, entry = [Segment(base, raw, "main")], int(a.entry or a.base, 16)
+        mem = Memory(segs, arch=5 if a.cpu == 9 else 4)
+        seeds = [entry] + [int(x, 16) for x in a.seeds.split(",") if x]
+        if oid is not None:
+            seeds += overlay_seeds(rom, a.cpu, oid, mem)
+            print("overlay %d:" % oid)
+        prog = Program(mem, seeds).run()
+        text, conf, unres = prog.summary()
+        print(text)
+        if oid is not None:
+            ov = [e for e in prog.funcs if mem.seg(e).overlay == oid]
+            print("overlay %d: %d functions (%d Thumb), %d reached from outside it" % (
+                oid, len(ov), sum(prog.funcs[e].thumb for e in ov),
+                len({c for c, _ in prog.crossing} & set(ov))))
+        if a.report:
+            for e, (at, why) in conf[:200]:
+                print("conflict  %08X in %08X: %s" % (at, e, why))
+            for e, (at, what) in unres[:400]:
+                print("unresolved %08X in %08X: %s" % (at, e, what))
+        if a.out:
+            with open(a.out.replace("{id}", str(oid)), "w") as fh:
+                for e in sorted(prog.funcs):
+                    f = prog.funcs[e]
+                    if oid is None or mem.seg(e).overlay == oid:
+                        fh.write("%08X\t%d\t%s\n" % (e, f.size, "T" if f.thumb else "A"))
+            for e, f in prog.funcs.items():
+                if mem.seg(e).overlay is None and e not in program:
+                    program[e] = f
+    if a.out and overlays != [None] and "{id}" in a.out:
+        # the program's own functions, with those only its overlays reach
+        with open(a.out.replace("{id}", "main"), "w") as fh:
+            for e in sorted(program):
+                f = program[e]
                 fh.write("%08X\t%d\t%s\n" % (e, f.size, "T" if f.thumb else "A"))
+        print("program: %d functions with what the overlays reach" % len(program))
 
 
 if __name__ == "__main__":

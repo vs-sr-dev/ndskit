@@ -44,6 +44,7 @@ python -m ndskit.hw 04000400 04000540                # names, as the ARM9 sees t
 python -m ndskit.hw --arm7 04000400                  # and the ARM7
 python -m ndskit.recomp.discover GAME.nds --cpu 9 --report --out funcs9.tsv   # every function, ARM or Thumb
 python -m ndskit.recomp.discover GAME.nds --cpu 7                              # the ARM7, where its autoloads run
+python -m ndskit.recomp.discover GAME.nds --cpu 9 --overlay all --out "f_{id}.tsv"   # each overlay with the program
 python -m ndskit.armemu GAME.nds --cpu 9 --call 0201234C --regs r0=7,r1=100   # run one function of the game
 python -m ndskit.recomp GAME.nds --out build/recomp [--optest] [--copy 9:DEST=SRC:LEN]   # both programs to C++, CMake
 python -m ndskit.recomp.selftest GAME.nds --cpu 9 --auto --out arm9.txt        # vectors of the functions that run alone
@@ -57,6 +58,7 @@ build/recomp/b/ndsrun GAME.nds --vblanks 600 --break 0211860C --calls 200       
 build/recomp/b/ndsrun GAME.nds --vblanks 600 --watch 022AA568:4                 # who stores there
 python -m ndskit.melonds STATE.ml1 --compare build/run                          # its memories and sound channels against melonDS's
 python -m ndskit.melonds STATE.ml1 --info                                       # a state's sections, VBlank count, channels
+python -m ndskit.melonds STATE.ml1 --overlays GAME.nds                          # which overlay each load address holds
 ```
 
 ## Layers
@@ -66,7 +68,7 @@ python -m ndskit.melonds STATE.ml1 --info                                       
 | 1. Recognise | What is on this cartridge? | `rom --info`: header and its CRCs, the secure area's state, both programs, NitroSDK's ModuleParams (autoloads to ITCM/DTCM, static BSS, compression, SDK version), overlay tables, banner (titles, icon) | a `fingerprint`: the SDK's ARM7 components by crc32, the SDK's libraries and middleware (Mobiclip, CRI, ...) by signature |
 | 2. Extract | Turn standard formats into standard files | `rom --extract` (files, `sys/` with header, programs, overlays and banner; NitroROM images inside, `--nested`; the SDK's backward LZ undone), `lz` (LZ10, LZ11, RLE), `sdat` (every record, files named by their symbols; the waves' formats and the banks' instrument kinds) | G2D (NCLR/NCGR/NSCR/NCER/NANR) to images, NSBMD/NSBTX, SWAV/STRM to WAV, NARC, NFTR |
 | 3. Map code | What does the code do, where? | `arm` (ARMv5TE and Thumb decoder, disassembly with literals resolved and registers named, `--refs`, `--census`), `hw` (both CPUs' address maps and register names), `armemu` (an interpreter for both CPUs: the recompiler's reference, and a way to run one of the game's functions), `ghidra/ExportFuncs.java` | SDK names by signature |
-| 4. Translate | Turn ARM code into C++ | `recomp.discover` (recursive descent over ARM and Thumb with the mode carried through interworking; the program read in segments where it runs, its autoloads included; constants through straight lines for veneers and calls through registers; CodeWarrior's `addls pc` switches; hand-written jumps through tables of offsets, followed through registers; returns set up in lr; pointer, boundary and prologue seeds to a fixed point; what each write to pc is), `recomp.emit` and `python -m ndskit.recomp` (one C++ function per entry, one module per program: conditions, flags stored only where read, the PC as a value, calls through registers dispatched by address and mode, switches, interworking, modes, exception returns), `recomp.selftest` (vectors from the interpreter: every instruction form, the game's functions that run alone) | Thumb switches, halfword-offset tables |
+| 4. Translate | Turn ARM code into C++ | `recomp.discover` (recursive descent over ARM and Thumb with the mode carried through interworking; the program read in segments where it runs, its autoloads included; constants through straight lines for veneers and calls through registers; CodeWarrior's `addls pc` switches; hand-written jumps through tables of offsets, followed through registers; returns set up in lr; pointer, boundary and prologue seeds to a fixed point; what each write to pc is; an overlay loaded with the program, calls into it from outside taken only where they walk clean), `recomp.emit` and `python -m ndskit.recomp` (one C++ function per entry, one module per program: conditions, flags stored only where read, the PC as a value, calls through registers dispatched by address and mode, switches, interworking, modes, exception returns), `recomp.selftest` (vectors from the interpreter: every instruction form, the game's functions that run alone) | Thumb switches, halfword-offset tables |
 | 5. Runtime | Replace the hardware | `runtime/` (C++20): the CPU context, the memories, the modes, the dispatch, the self-test; the machine (`ndsrun`): both CPUs in quanta of virtual time, each guest thread on its own coroutine (the SDK's context switches followed), interrupts as the BIOS takes them, the BIOS's SWIs, a direct boot as melonDS does it, the I/O of both CPUs, VRAM through its banks, timers, DMA, IPC, the maths unit, the cartridge's commands and its backup memory, SPI (power, firmware, touch), the RTC; a call trace, breaks and a store watch; the 2D engines in software a line at a time, the geometry engine in the DS's fixed point, the rendering engine on OpenGL 4.5 at any scale (the texture memory read in the shader), a compositor, a window (SDL3) with the keyboard and the mouse, headless pictures; the sound unit (16 channels, capture, the mixer) in virtual time, an SDL3 audio stream, WAV files. `melonds`: savestates read, memories and sound channels compared | the 3D's anti-aliasing, edge marking, shadow polygons; display capture; the cartridge's time |
 
 ## Principles
@@ -95,13 +97,16 @@ python -m ndskit.melonds STATE.ml1 --info                                       
 | `runtime` (the picture, session 5) | Moon's logos, movies, menus, title and first room (1 103 polygons a frame, fog) against melonDS's pictures at the same frames: the title's 3D within 496 of 38 400 pixels, the menu's lower screen identical but for a pulsing border, the first room apart at polygon edges (anti-aliasing) and where the player stands; in a window in real time |
 | `runtime` (the sound, session 6) | Moon's music, effects and movie sound in the window and as WAV files; against melonDS's savestates at five frames with no input, the same channels with the same registers (format, volume, divider, pan, source, timer, loop, length). The BIOS's sine, pitch and volume tables equal to the BIOS's own, all 1 556 values |
 | `recomp.discover` (session 4) | Moon's ARM9: all 4 680 of Ghidra's functions covered (6 580 functions, 166 switches); every entry of session 3 kept. 0 conflicts on the three cartridges, each with more functions found (a 2010 one 2 214 to 2 319, a 2008 one 3 090 to 3 201) |
+| `recomp.discover` (overlays) | a 2009 cartridge's 14 ARM9 overlays (two slots, 117 direct calls from the main program into them), each loaded with the program: 0 conflicts; the program's functions with those only overlays reach cover all of Ghidra's that can run (4 090 of 4 101, the rest a dead cluster). A 2008 cartridge's 3 overlays: 0 conflicts. Without overlays, discovery on the four cartridges unchanged but for one false Thumb entry (a string's odd address) now refused |
+| `melonds --overlays` | a 2009 cartridge's states at its title (overlay 1, 99.55% of its bytes) and in play (overlay 0, 99.95%) |
 
 ## Known gaps
 
 * `rom`: compressed overlays are read (the OVT's flag) but none has been
   met yet; the backward LZ is checked on an ARM9 only.
 * `lz`: Huffman (types 0x2x) is not done.
-* `recomp.discover`: CodeWarrior's Thumb switches and a newer SDK ARM7's
+* `recomp.discover`: overlays that a game compresses itself (the overlay
+  table's flag clear) are read as stored; CodeWarrior's Thumb switches and a newer SDK ARM7's
   halfword-offset tables are not recognised yet; code a program copies
   elsewhere at run time is not found by itself (the runtime names the
   block when it meets a call into it; `--copy` gives it to the

@@ -2,6 +2,7 @@
 
     python -m ndskit.melonds STATE.ml1 --info
     python -m ndskit.melonds STATE.ml1 --peek ADDR[:LEN] ...
+    python -m ndskit.melonds STATE.ml1 --overlays GAME.nds   # which overlay each load address holds
     python -m ndskit.melonds STATE.ml1 --compare RUNDIR [--ranges N] [--ignore LO-HI,...]
 
 A savestate (melonDS 1.x, "MELN") is a list of sections, each a 4-byte
@@ -193,10 +194,32 @@ def compare(state, rundir, nranges=12, ignore=()):
             print("    " + "  ".join(line.strip() for line in open(p)))
 
 
+def overlays_loaded(state, rom_path, out=print):
+    """Which of a cartridge's ARM9 overlays each load address holds in the state:
+    the share of each overlay's bytes found in memory (its data may have changed
+    since it was loaded, so the best match is named, not an exact one)."""
+    from .rom import Rom, blz_decompress
+    with open(rom_path, "rb") as f:
+        rom = Rom(f.read())
+    slots = {}
+    for o in rom.overlays9:
+        d = rom.file(o.file_id)
+        d = blz_decompress(d) if o.compressed else d[:o.ram_size]
+        mem = state.read(o.ram, len(d))
+        same = sum(1 for x, y in zip(d, mem) if x == y) / max(1, len(d))
+        slots.setdefault(o.ram, []).append((same, o.id, len(d)))
+    for ram, cands in sorted(slots.items()):
+        cands.sort(reverse=True)
+        same, oid, n = cands[0]
+        rest = ", ".join("%d %.0f%%" % (i, 100 * s) for s, i, _ in cands[1:4])
+        out("%08X  overlay %-3d %6.2f%% of its %d bytes   (next: %s)" % (ram, oid, 100 * same, n, rest))
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("state")
     ap.add_argument("--info", action="store_true")
+    ap.add_argument("--overlays", metavar="ROM", help="which of the cartridge's ARM9 overlays are in memory")
     ap.add_argument("--peek", nargs="*", default=[], help="ADDR[:LEN], hex")
     ap.add_argument("--compare", metavar="RUNDIR")
     ap.add_argument("--ranges", type=int, default=12)
@@ -209,6 +232,8 @@ def main(argv=None):
         print("SDK VBlank count: %d" % st.u32(0x027FFC3C))
         for line in sound_lines(st.sound()[0]):
             print(line)
+    if a.overlays:
+        overlays_loaded(st, a.overlays)
     for p in a.peek:
         addr, _, n = p.partition(":")
         addr, n = int(addr, 16), int(n or "10", 16)
