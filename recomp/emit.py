@@ -188,7 +188,13 @@ class Body:
             if cond:
                 out.append(nxt)
         elif op in ("bl", "blx") and ins.target is not None:
-            out.append(nxt)
+            if a in self.f.sites:               # a Thumb bl used as a long branch
+                if ins.target in code:
+                    out.append(ins.target)
+                else:
+                    ext = True
+            else:
+                out.append(nxt)
         elif (op == "blx" or a in self.f.sites) and not self._exception_return(ins):
             kind, target, ret = self.f.sites.get(a, ("call", None, nxt | self.T))
             if kind == "call":                  # back at lr: here, further on, or another entry
@@ -694,6 +700,11 @@ class Body:
         if op in ("bl", "blx") and ins.target is not None:
             to_thumb = (not self.thumb) if op == "blx" else self.thumb
             ret = nxt | T
+            if a in self.f.sites:               # a Thumb bl used as a long branch (recomp.discover)
+                lr = "%s = %s; " % (_r(14), _h(ret))
+                if ins.target in self.f.code:
+                    return lr + self._goto(ins.target, a), False
+                return lr + self._tail(ins.target | int(to_thumb)), False
             saved = " arm_context_saved(c);" if ins.target in self.twice else ""
             return ("%s = %s; ARM_POLL(c); %s%s"
                     % (_r(14), _h(ret), self._unwind("%s ARM_RET(c, %s);" % (

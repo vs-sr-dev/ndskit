@@ -21,7 +21,12 @@ output (the compiler of NitroSDK games) and the SDK's hand-written parts:
    both ways, `b`, switch tables, fall-through, conditional instructions
    (including conditional returns) running on. A `b` to another
    function's entry is a tail call and is not followed. Returns: `bx lr`,
-   `mov pc, lr`, `pop`/`ldm` with pc. An address the function puts in lr
+   `mov pc, lr`, `pop`/`ldm` with pc, and Thumb's `pop {rX}; [add sp, #k;]
+   bx rX` (lr taken back into a low register so that arguments pushed at
+   the entry can be dropped). A Thumb `bl` is a long branch, not a call,
+   when its target lies inside the function's own span (`bls ok; bl
+   default` before a switch) or when what follows it is a literal pool
+   (past one `mov r8, r8`): it is walked as a `b`. An address the function puts in lr
    itself (`mov lr, pc`, `add lr, pc, #n`) is walked too: code that runs
    when a local subroutine returns there.
 4. Constants are propagated through a straight line of code (`ldr` from
@@ -35,7 +40,8 @@ output (the compiler of NitroSDK games) and the SDK's hand-written parts:
    (or `add lr, pc, #n`) before a jump through a register, or an address
    put in lr earlier in the same straight line (`sub lr, pc, #n` at a
    dispatch loop's head), makes it a call: execution resumes at lr's
-   value. Two conditional transfers in a row with opposite conditions on
+   value; a conditional one too (`movne lr, pc; bxne r12`, a hook called
+   when it is set). Two conditional transfers in a row with opposite conditions on
    the same flags (`bxpl r12` then `popmi {..., pc}`) end the block:
    nothing runs after them. That holds on a straight line only: when the
    walk applied it across an address that something also jumps to (a
@@ -54,7 +60,14 @@ output (the compiler of NitroSDK games) and the SDK's hand-written parts:
    no bound, a table of branches is read
    while its entries are branches, and an unconditional `add pc, pc, rI,
    lsl #2` into code that is not a table (the SDK's unrolled division)
-   takes every instruction of the run it lands in. Tables of offsets from
+   takes every instruction of the run it lands in, as does an `add pc, pc,
+   rI, lsl #3` (an unrolled copy entered by steps of two instructions).
+   Tables of halfword offsets right after the jump: CodeWarrior's Thumb
+   switch (`adds rB, rI, rI; add rB, pc; ldrh rB, [rB, #k]; lsls rB, rB,
+   #16; asrs rB, rB, #16; add pc, rB`, signed offsets from the jump + 4)
+   and a newer SDK ARM7's (`add rB, pc, rI, lsl #1; ldrh rB, [rB, #k];
+   add pc, pc, rB`), the bound from the compare before (through `bls ok;
+   b default` or a long `bl default`). Tables of offsets from
    their own address (hand-written code): `ldr rX, [rT, rI{, lsl #2}]`
    with rT a constant, then `add pc, rT, rX`, or `add rY, rT, rX` ...
    `mov pc, rY` (`bx rY`), the registers followed through the straight
@@ -89,6 +102,9 @@ output (the compiler of NitroSDK games) and the SDK's hand-written parts:
    A trial descent (for a pointer, a prologue or a crossing) that runs
    into a literal it loads itself is refused: an odd pointer to a string
    passed to a formatter has two marks and decodes as Thumb for a while.
+   An entry guessed this way whose descent meets data once everything is
+   known is refused too, and the discovery done again without it: a
+   pointer or a call meant for another overlay over the same addresses.
 8. Overlays (`--overlay N`, or `all` one at a time): the program with
    overlay N loaded at its address as a segment of its own, its static
    initialisers (the pointers between its sinit start and end) as seeds.
@@ -120,13 +136,18 @@ small virtual methods and thunks, reached through vtables). Its ARM7
 (session 2): 535 of Ghidra's 536 (the program read where its autoloads
 run). No conflict on Moon or two other cartridges; and the runtime ran
 Moon from its boot into its first room on what this finds.
-Known gaps: CodeWarrior's Thumb switches (`add pc, rI` after a `lsl`;
-a Thumb-heavy 2008 cartridge leaves half its ARM9 unclassified), and the
-switches through tables of halfword offsets in a newer SDK's ARM7 (`cmp
-rI, #N; bhi default; add rI, pc, rI, lsl #1; ldrh rI, [rI, #4]; add pc,
-pc, rI`). Overlays that the game compresses itself (the overlay table's
-flag clear, the file in a format of the game's) are read as they are
-stored.
+Known gaps: overlays that the game compresses itself (the overlay
+table's flag clear, the file in a format of the game's) are read as they
+are stored; code a game decrypts at run time (an overlay whose static
+initialisers decrypt it, an anti-piracy library) is read encrypted.
+
+Checked with Thumb switches and halfword tables (session 1 of a 2010
+port, Thumb in 28% of its ARM9): on that cartridge 163 switches where
+there were 118, its ARM7's 39 where there were 2, 0 conflicts in its
+program, ARM7 and 19 of its 20 overlays (the twentieth encrypted);
+CodeWarrior's Thumb switches on the 2008 cartridge too (its overlays
+1 143 and 628 functions more). On the two ports' cartridges nothing
+changed.
 
 Checked with overlays on a 2009 cartridge (14 ARM9 overlays in two
 slots, 117 direct calls from the main program into them): 0 conflicts in
@@ -267,6 +288,7 @@ class Program:
         self.crossing = set()      # (address, thumb) reached in an overlay from outside it
         self.foreign = set()       # the same, found by another overlay's run (a stricter test)
         self.areas = []            # (lo, hi): other overlays' areas, not loaded in this run
+        self.far_bl = set()        # Thumb `bl`s used as long branches: they do not return
 
     def _elsewhere(self, a):
         """a lies in another overlay's area, its code not loaded here."""
@@ -325,12 +347,23 @@ class Program:
         """Descend one function: its code, calls, tail calls, conflicts, unresolved
         jumps. The rule of opposite conditions holds on a straight line only: where
         it ended a block across an address that something also jumps to (a join, met
-        with other flags), the descent is done again without it there."""
+        with other flags), the descent is done again without it there. A Thumb `bl`
+        whose fall-through runs into data (past one `mov r8, r8`) is a long branch
+        that does not come back: the descent is done again with it as one."""
         joins = set()
         while True:
             f.__init__(f.entry, f.thumb)
+            far = len(self.far_bl)
             bad = self._walk_once(f, commit, joins)
-            if bad <= joins:
+            if f.thumb and f.code:
+                # a bl into the middle of its own function is a long branch too
+                # (`bls ok; bl default` before a switch, the default being the epilogue)
+                lo, hi = min(f.code), max(f.code)
+                for a in f.code:
+                    ins = self.mem.insn(a, True)
+                    if ins.op == "bl" and lo < ins.target <= hi:
+                        self.far_bl.add(a)
+            if bad <= joins and len(self.far_bl) == far:
                 return f
             joins |= bad
 
@@ -347,8 +380,12 @@ class Program:
             regs = dict(regs)
             ended = None    # condition of the last conditional transfer, while the flags hold
             since = []      # the addresses passed since it
+            after_bl = None     # a Thumb bl whose fall-through this is (past one `mov r8, r8`)
             while True:
                 if pc in seen:
+                    break
+                if after_bl is not None and self._is_data_after_bl(pc, own):
+                    self.far_bl.add(after_bl)
                     break
                 if pc != f.entry and self.entries.get(pc) == thumb:
                     f.tails.add((pc, thumb))
@@ -400,8 +437,21 @@ class Program:
                     ruled.append(list(since))
                 if ins.s or op in arm.COMPARES:
                     ended, since = None, []
+                if after_bl is not None and not (op == "mov" and ins.rd == 8 and ins.rm == 8 and pc == after_bl + 4):
+                    after_bl = None
                 if op in ("bl", "blx") and ins.target is not None:
-                    f.calls.add((ins.target, ins.exchange == "thumb" if ins.exchange else thumb))
+                    to = (ins.target, ins.exchange == "thumb" if ins.exchange else thumb)
+                    if pc in self.far_bl:       # a long branch: as an unconditional b
+                        f.sites[pc] = ("jump", ins.target | thumb, None)
+                        targets.add(ins.target)
+                        if self.entries.get(ins.target) == thumb and ins.target != f.entry:
+                            f.tails.add(to)
+                            break
+                        pc = ins.target
+                        continue
+                    f.calls.add(to)
+                    if thumb and op == "bl":
+                        after_bl = pc
                     pc = nxt
                     continue
                 if op == "blx":             # through a register
@@ -429,7 +479,8 @@ class Program:
                     continue
                 # everything else that writes pc
                 if op == "bx" and ins.rm == 14 or op == "mov" and ins.rm == 14 and ins.imm is None \
-                        or op == "ldm" or op == "ldr" and ins.rn == 13 and ins.writeback:
+                        or op == "ldm" or op == "ldr" and ins.rn == 13 and ins.writeback \
+                        or self._popped_return(ins):
                     f.sites[pc] = ("return", None, None)
                     if go_on:                   # a conditional return
                         ended, since = cond, []
@@ -452,7 +503,7 @@ class Program:
                     target = mem.u32(ins.target)
                 else:
                     target = None
-                lr = self._lr_set(pc, thumb)
+                lr = self._lr_set(pc, thumb, cond)
                 if lr is None and lr_before is not None and mem.inside(lr_before & ~1):
                     lr = lr_before          # lr set further back in the straight line
                 kind = "call " if lr is not None else "jump "
@@ -488,11 +539,28 @@ class Program:
                 f.conflicts.append((min(hit), "runs into its own literal"))
         return {a for path in ruled for a in path if a in targets}
 
-    def _lr_set(self, pc, thumb):
+    def _popped_return(self, ins):
+        """Thumb's return through a register: `pop {rX}; [add sp, #k;] bx rX`, lr
+        taken back into rX so that the arguments pushed at the entry can be
+        dropped after it (`push {r0-r3}; push {r3, lr}` ... `pop {r3}; pop {r3};
+        add sp, #16; bx r3`)."""
+        if not ins.thumb or ins.op != "bx" or ins.cond != 14 or ins.rm in (13, 14, 15):
+            return False
+        p = self.mem.insn(ins.pc - 2, True)
+        if p is not None and p.op == "add" and p.rd == 13 and p.rn == 13 and p.imm is not None:
+            p = self.mem.insn(p.pc - 2, True)
+        return p is not None and p.op == "ldm" and p.rn == 13 and p.writeback and p.reglist == 1 << ins.rm
+
+    def _is_data_after_bl(self, pc, own):
+        """pc, where a Thumb bl would come back, is data: a literal pool."""
+        return any(b in self.data or b in own for b in (pc, pc + 1))
+
+    def _lr_set(self, pc, thumb, cond=14):
         """If the instruction before pc set lr to a return address (mov lr, pc /
-        add lr, pc, #n), that address; else None."""
+        add lr, pc, #n), with no condition or the transfer's own (`movne lr, pc;
+        bxne r12`), that address; else None."""
         p = self.mem.insn(pc - (2 if thumb else 4), thumb)
-        if p is None or p.rd != 14 or p.cond != 14:
+        if p is None or p.rd != 14 or p.cond not in (14, cond):
             return None
         if p.op == "mov" and p.rm == 15 and p.imm is None and p.shift_imm == 0:
             return p.pc + 8
@@ -503,8 +571,20 @@ class Program:
     def _switch(self, f, ins, regs, commit):
         """Targets of a recognised computed jump, or None."""
         mem, thumb = self.mem, f.thumb
+        half = self._half_table(ins, commit)
+        if half is not None:
+            return half
         if thumb or ins.rm is None or ins.rs is not None or ins.imm is not None:
             return None
+        # a jump into unrolled code by steps of two or more instructions
+        # (`rsb r3, r2, #8; add pc, pc, r3, lsl #3`, a copy of 0-8 bytes): any of its instructions
+        if ins.op == "add" and ins.rd == 15 and ins.rn == 15 and ins.shift == "lsl" and ins.shift_imm in (3, 4) \
+                and ins.cond == 14:
+            targets = self._run(ins.pc + 8)
+            if not targets:
+                return None
+            self.switches[ins.pc] = targets
+            return targets
         # CodeWarrior: [cmp rI, #N] addls pc, pc, rI, lsl #2 ; b default ; N+1 entries
         if ins.op == "add" and ins.rd == 15 and ins.rn == 15 and ins.shift == "lsl" and ins.shift_imm == 2:
             first = ins.pc + 8
@@ -548,6 +628,70 @@ class Program:
         lr = self._lr_set(ins.pc, False)
         if lr is not None:
             targets = targets + [lr]
+        self.switches[ins.pc] = targets
+        return targets
+
+    def _half_table(self, ins, commit):
+        """Targets of a switch through a table of halfword offsets right after
+        the jump, or None. CodeWarrior's Thumb switch: [cmp rI, #N; bhi
+        default] adds rI, rI, rI; add rI, pc; ldrh rI, [rI, #k]; lsls rI, rI,
+        #16; asrs rI, rI, #16; add pc, rI (signed offsets from the jump + 4);
+        a newer SDK's ARM code: [cmp rI, #N; bhi default] add rT, pc, rI, lsl
+        #1; ldrh rT, [rT, #k]; add pc, pc, rT (offsets from the jump + 8). The
+        table holds N + 1 entries; its bytes are data."""
+        if ins.op != "add" or ins.rd != 15 or ins.rn != 15 or ins.rm is None or ins.shift is not None \
+                or ins.cond != 14:
+            return None
+        mem, thumb = self.mem, ins.thumb
+        step = 2 if thumb else 4
+        r = ins.rm
+        p = mem.insn(ins.pc - step, thumb)
+        signed = False
+        if thumb and p is not None and p.op == "mov" and p.shift == "asr" and p.shift_imm == 16 \
+                and p.rd == r and p.rm == r:
+            q = mem.insn(p.pc - step, True)
+            if q is None or not (q.op == "mov" and q.shift == "lsl" and q.shift_imm == 16 and q.rd == r and q.rm == r):
+                return None
+            signed, p = True, mem.insn(q.pc - step, True)
+        if p is None or p.op != "ldrh" or p.rd != r or p.rm is not None or not p.pre or not p.add \
+                or p.writeback or p.imm is None or p.cond != 14:
+            return None
+        rb, k = p.rn, p.imm
+        a = mem.insn(p.pc - step, thumb)
+        if a is None or a.op != "add" or a.rd != rb or a.cond != 14:
+            return None
+        if thumb:                               # add rB, pc; before it rB = 2 x rI
+            if a.rn != rb or a.rm != 15 or a.shift is not None:
+                return None
+            pcv = a.pc + 4
+            d = mem.insn(a.pc - 2, True)
+            if d is not None and d.op == "add" and d.rd == rb and d.rm is not None and d.rn == d.rm \
+                    and d.shift is None:
+                index = d.rn
+            elif d is not None and d.op == "mov" and d.rd == rb and d.shift == "lsl" and d.shift_imm == 1:
+                index = d.rm
+            else:
+                return None
+            guard = d.pc
+        else:                                   # add rB, pc, rI, lsl #1
+            if a.rn != 15 or a.rm is None or a.shift != "lsl" or a.shift_imm != 1:
+                return None
+            pcv, index, guard = a.pc + 8, a.rm, a.pc
+        n = self._bound(guard, index, thumb)
+        if n is None or n > 1024:
+            return None
+        table, base = pcv + k, ins.pc + (4 if thumb else 8)
+        targets = []
+        for i in range(n + 1):
+            h = mem.u16(table + 2 * i)
+            if h is None:
+                return None
+            t = base + (h - 0x10000 if signed and h & 0x8000 else h)
+            if t & 1 or (not thumb and t & 3) or not mem.inside(t, step) or table <= t < table + 2 * (n + 1):
+                return None
+            targets.append(t)
+        if commit:
+            self.data.update(range(table, table + 2 * (n + 1)))
         self.switches[ins.pc] = targets
         return targets
 
@@ -602,12 +746,13 @@ class Program:
         """N from the `cmp reg, #N` that guards a switch, walking back through
         a straight line (conditional branches out of it included); through
         `subs reg, rX, #k` after a `cmp rX, #N` (a range of cases from k): N - k."""
-        step = 2 if thumb else 4
         k = 0
+        a = at
         for back in range(1, 10):
-            p = self.mem.insn(at - step * back, thumb)
+            p = self._prev(a, thumb)
             if p is None:
                 return None
+            a = p.pc
             if p.op == "cmp" and p.rn == reg and p.imm is not None:
                 if signed and p.imm == 0 and not k:
                     continue            # `addge` after `cmp rI, #0`: the lower bound; the upper is further back
@@ -616,9 +761,22 @@ class Program:
                     and p.cond == 14 and p.shift is None:
                 reg, k = p.rn, k + p.imm
                 continue
+            if p.op in ("b", "bl") and p.cond == 14:    # Thumb: `bls ok; b default` (or a long `bl default`)
+                q = self._prev(p.pc, thumb)
+                if q is not None and q.op == "b" and q.cond != 14 and q.target == p.pc + p.size:
+                    continue
             if reg in _clobbers(p) or (p.writes_pc and (p.cond == 14 or p.is_call)):
                 return None
         return None
+
+    def _prev(self, a, thumb):
+        """The instruction before a: in Thumb a `bl` (two halfwords) when one ends there."""
+        if thumb:
+            p = self.mem.insn(a - 4, True)
+            if p is not None and p.size == 4:
+                return p
+            return self.mem.insn(a - 2, True)
+        return self.mem.insn(a - 4, False)
 
     # ---- the whole program ---------------------------------------------
     def _descend_all(self, commit):
@@ -639,6 +797,27 @@ class Program:
                     work.append((c, ct))
 
     def run(self, max_rounds=12):
+        """Discover to a fixed point. An entry guessed in a round (from a pointer
+        in data, a prologue, a call into an overlay from outside it) whose descent
+        meets data once the rest is known was not one: most often another
+        overlay's function, loaded at the same addresses or at another base over
+        them, reached through a pointer or a call meant for it. It is refused and
+        the discovery done again without it."""
+        self.refused = set()
+        for _ in range(4):
+            self.guessed = set()
+            self._rounds(max_rounds)
+            bad = {a for a in self.guessed if a in self.funcs and self.funcs[a].conflicts}
+            if not bad:
+                break
+            self.refused |= bad
+            self.entries, self.crossing, self.switches = {}, set(), {}
+            self.literal_loaded, self.funcs, self.code, self.data = set(), {}, {}, set()
+        self.returns_twice = self._returns_twice()
+        self.landings = self._landings()
+        return self
+
+    def _rounds(self, max_rounds):
         for a, t in self.seeds:
             self.entries[a] = t
         last = -1
@@ -655,15 +834,13 @@ class Program:
                 for a in f.code:
                     self.code[a] = 2 if f.thumb else 4
             new = self._pointer_seeds() | self._prologue_seeds() | self._crossing_seeds()
-            new = {(a, t) for a, t in new if a not in self.entries}
+            new = {(a, t) for a, t in new if a not in self.entries and a not in self.refused}
+            self.guessed |= {a for a, _ in new}
             if not new or len(self.entries) == last:
                 break
             last = len(self.entries)
             for a, t in new:
                 self.entries[a] = t
-        self.returns_twice = self._returns_twice()
-        self.landings = self._landings()
-        return self
 
     def _returns_twice(self):
         """Functions that store an address of their own code to memory: a
@@ -721,7 +898,7 @@ class Program:
         another overlay loaded at the same address."""
         out = set()
         for a, thumb in self.crossing | self.foreign:
-            if a in self.entries:
+            if a in self.entries or a in self.refused:
                 continue
             ins = self.mem.insn(a, thumb)
             if ins is None or ins.cond != 14:
