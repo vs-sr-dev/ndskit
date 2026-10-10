@@ -246,6 +246,12 @@ int overlay_fn(int cpu, uint32_t key) {
             A.state[j] = there ? THERE : GONE;
             auto f = std::find(A.found.begin(), A.found.end(), it->m);
             if (there && f == A.found.end()) {
+                // the overlays whose area meets its area are taken for gone (found again
+                // when one of their functions is): each change of hands is told
+                const ArmSegment& s = it->m->segs[0];
+                A.found.erase(std::remove_if(A.found.begin(), A.found.end(), [&](const ArmModule* o) {
+                    return s.base < o->segs[0].base + o->segs[0].size && o->segs[0].base < s.base + s.size;
+                }), A.found.end());
                 A.found.push_back(it->m);
                 arm_overlay_found(cpu, it->m);
             } else if (!there && f != A.found.end()) {
