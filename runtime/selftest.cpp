@@ -2,7 +2,11 @@
 // the vectors ndskit/recomp/selftest.py recorded with the interpreter
 // (armemu), and every result compared.
 //
-//     selftest VECTORS.txt ...
+//     selftest [--interp] VECTORS.txt ...
+//
+// --interp runs every vector through the runtime's interpreter (interp.cpp)
+// instead of the recompiled function, callees interpreted too: the
+// interpreter checked against armemu's vectors as the recompiler is.
 //
 // A vectors file is lines of:
 //     cpu 9|7                 the CPU of what follows (its memory map; memory cleared)
@@ -64,16 +68,19 @@ static void clear() {
     std::memset(g_dtcm, 0, 0x4000);
     std::memset(g_wram7, 0, 0x10000);
     std::memset(g_swram, 0, 0x8000);
+    arm_overlays_unknown();                        // memory changed behind the stores' back
 }
 
 int main(int argc, char** argv) {
-    if (argc < 2) {
-        std::fprintf(stderr, "usage: selftest VECTORS.txt ...\n");
+    int first = 1;
+    if (argc > 1 && !std::strcmp(argv[1], "--interp")) { g_arm_interp_only = 1; ++first; }
+    if (argc <= first) {
+        std::fprintf(stderr, "usage: selftest [--interp] VECTORS.txt ...\n");
         return 2;
     }
     std::atexit(where);
     long total_funcs = 0, total_vec = 0, total_bad = 0;
-    for (int fi = 1; fi < argc; ++fi) {
+    for (int fi = first; fi < argc; ++fi) {
         std::ifstream in(argv[fi]);
         if (!in) { std::fprintf(stderr, "cannot read %s\n", argv[fi]); return 2; }
         std::string line, label;
@@ -99,7 +106,6 @@ int main(int argc, char** argv) {
                     std::fprintf(stderr, "cannot load %s at %s\n", path.c_str(), base.c_str());
                     return 2;
                 }
-                ++g_arm_overlay_epoch;      // another overlay may now be where the last file's was
             } else if (kw == "module") {
                 std::string name;
                 ss >> name;
@@ -123,7 +129,8 @@ int main(int argc, char** argv) {
                 put(c, w, cpu);
                 c.r[14] = kSentinel; c.pc = 0; c.budget = 1 << 20;
                 g_where = std::string(argv[fi]) + ": " + label + ", vector " + std::to_string(fvec + 1);
-                arm_call(c, key);
+                if (g_arm_interp_only) arm_interpret(c, key);
+                else arm_call(c, key);
                 g_where.clear();
                 get(c, got);
                 ++vec; ++fvec;
@@ -159,7 +166,7 @@ int main(int argc, char** argv) {
         std::printf("%s: %ld functions, %ld vectors, %ld failures\n", argv[fi], funcs, vec, bad);
         total_funcs += funcs; total_vec += vec; total_bad += bad;
     }
-    if (argc > 2)
+    if (argc > first + 1)
         std::printf("total: %ld functions, %ld vectors, %ld failures\n", total_funcs, total_vec, total_bad);
     return total_bad ? 1 : 0;
 }

@@ -115,7 +115,6 @@ uint32_t cart_data_word(int cpu) {
     (void)cpu;
     if (g_pos >= g_data.size()) return 0xFFFFFFFFu;
     uint32_t w = g_data[g_pos++];
-    ++g_arm_overlay_epoch;                          // memory may change under an overlay's code
     if (g_pos == g_data.size()) finish();
     return w;
 }

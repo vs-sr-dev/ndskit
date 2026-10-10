@@ -6,7 +6,7 @@
 #                   the audio device (SDL3, OpenGL 4.5)
 # A target links ndskit_core, then ndskit_stub or ndskit_machine, then recomp.
 set(_rt ${CMAKE_CURRENT_LIST_DIR})
-add_library(ndskit_core OBJECT ${_rt}/core.cpp)
+add_library(ndskit_core OBJECT ${_rt}/core.cpp ${_rt}/interp.cpp)
 add_library(ndskit_stub OBJECT ${_rt}/services_stub.cpp)
 add_library(ndskit_machine OBJECT
     ${_rt}/coro.cpp ${_rt}/machine.cpp ${_rt}/bios.cpp ${_rt}/mmio.cpp ${_rt}/system.cpp

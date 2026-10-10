@@ -39,8 +39,10 @@ typedef void (*ArmFunc)(ArmContext&);
 // they run (to recognise them), and its entries sorted by key (the address,
 // bit 0 set for Thumb).
 struct ArmFuncEntry { uint32_t key; ArmFunc fn; };
-enum { ARM_SEG_PROGRAM = 0, ARM_SEG_COPIED = 1, ARM_SEG_OVERLAY = 2 };
-struct ArmSegment { uint32_t base, size, crc, kind; };    // kind: ARM_SEG_*; copied: put there at run time
+enum { ARM_SEG_PROGRAM = 0, ARM_SEG_COPIED = 1, ARM_SEG_OVERLAY = 2, ARM_SEG_LOADED = 3 };
+// kind: ARM_SEG_*; copied: put there at run time; loaded: the program as the cartridge
+// loads it, compressed, before its crt0 decompresses it in place (not code)
+struct ArmSegment { uint32_t base, size, crc, kind; };
 struct ArmRange { uint32_t base, size; };
 struct ArmModule {
     const char* name;
@@ -51,19 +53,15 @@ struct ArmModule {
     uint32_t nfuncs;
     const uint32_t* landings;           // return addresses of calls to a context save (sorted keys)
     uint32_t nlandings;
-    // An overlay's module (overlay >= 0; its one segment is where it loads, shared
-    // with other overlays): resident when the bytes of its code (the ranges, data
-    // left out: it changes once loaded) have code_crc; firsts[i] is the first
-    // instruction of funcs[i], checked at each call dispatched into it;
-    // samples: (address, word) pairs spread over the code, a cheap check that
-    // the resident overlay is still there after memory may have changed.
+    // An overlay's module (overlay >= 0; its one segment is where it loads, over
+    // other overlays' areas): funcs[i] runs recompiled while the bytes of
+    // extents[i] (its code and literal pools) have the crc32 crcs[i], checked
+    // again whenever memory under them was written. Overlays loaded over the
+    // middle of others, partly overwritten or decrypting themselves are told
+    // apart function by function; what matches no module is interpreted.
     int overlay;
-    const ArmRange* code;
-    uint32_t ncode;
-    uint32_t code_crc;
-    const uint32_t* firsts;
-    const uint32_t* samples;
-    uint32_t nsamples;
+    const ArmRange* extents;
+    const uint32_t* crcs;
 };
 
 // A return that went to a landing of the active module, not to the call's
@@ -83,6 +81,17 @@ extern uint32_t g_dtcm_size;            // 0x4000 while CP15 enables the DTCM, e
 // A store watch (a debugging aid): every store into [g_watch_lo, +g_watch_len) is reported.
 extern uint32_t g_watch_lo, g_watch_len;
 void nds_watch_hit(int cpu, uint32_t a, uint32_t v, int size);
+// The overlays' areas of each CPU ([0] the ARM9's): a store there marks its
+// 256-byte page written, and the overlay functions over it are checked again
+// before they run (core.cpp).
+extern uint32_t g_ovl_lo[2], g_ovl_len[2];
+extern uint8_t* g_ovl_dirty[2];
+extern uint8_t g_ovl_any[2];
+template <int CPU> static inline void nds_ovl_store(uint32_t a) {
+    const int i = CPU == 9 ? 0 : 1;
+    uint32_t o = a - g_ovl_lo[i];
+    if (ARM_UNLIKELY(o < g_ovl_len[i])) { g_ovl_dirty[i][o >> 8] = 1; g_ovl_any[i] = 1; }
+}
 uint32_t nds_io_read(int cpu, uint32_t a, int size);    // everything else (core.cpp)
 void     nds_io_write(int cpu, uint32_t a, uint32_t v, int size);
 uint32_t nds_mmio_read(int cpu, uint32_t a, int size);  // what nds_io_* does not hold: the hardware
@@ -116,17 +125,20 @@ template <int CPU> static inline uint32_t nds_ld32(uint32_t a) {
 }
 template <int CPU> static inline void nds_st8(uint32_t a, uint32_t v) {
     if (ARM_UNLIKELY(a - g_watch_lo < g_watch_len)) nds_watch_hit(CPU, a, v & 0xFFu, 1);
+    nds_ovl_store<CPU>(a);
     if (uint8_t* p = nds_fast<CPU>(a)) *p = (uint8_t)v;
     else nds_io_write(CPU, a, v & 0xFFu, 1);
 }
 template <int CPU> static inline void nds_st16(uint32_t a, uint32_t v) {
     if (ARM_UNLIKELY(a - g_watch_lo < g_watch_len)) nds_watch_hit(CPU, a, v & 0xFFFFu, 2);
+    nds_ovl_store<CPU>(a);
     uint16_t w = (uint16_t)v;
     if (uint8_t* p = nds_fast<CPU>(a)) std::memcpy(p, &w, 2);
     else nds_io_write(CPU, a, v & 0xFFFFu, 2);
 }
 template <int CPU> static inline void nds_st32(uint32_t a, uint32_t v) {
     if (ARM_UNLIKELY(a - g_watch_lo + 3 < g_watch_len + 3)) nds_watch_hit(CPU, a, v, 4);
+    nds_ovl_store<CPU>(a);
     if (uint8_t* p = nds_fast<CPU>(a)) std::memcpy(p, &v, 4);
     else nds_io_write(CPU, a, v, 4);
 }
@@ -258,6 +270,12 @@ void     arm_cp15_write(ArmContext& c, int op1, int crn, int crm, int op2, uint3
 void     arm_bad_return(ArmContext& c, uint32_t expected);   // a return went elsewhere
 void     arm_call_unknown(ArmContext& c, uint32_t key);  // services: a call to a non-entry
 void     arm_context_saved(ArmContext& c);               // a context save returned (its caller's sp)
+// Run the guest code at `key` (bit 0: Thumb) from memory as it is now, until it
+// returns to lr as it was at the call (c.pc then holds where it went): code no
+// module holds (decrypted or copied at run time) or the emitter could not take.
+void     arm_interpret(ArmContext& c, uint32_t key);   // (interp.cpp)
+void     arm_interpreting(ArmContext& c, uint32_t key);  // services: the interpreter starts at key
+extern int g_arm_interp_only;                            // every call interpreted (the self-test's --interp)
 
 // A safe point: backward jumps, calls, and an msr that may unmask interrupts.
 #define ARM_POLL(c) do { if (ARM_UNLIKELY(--(c).budget < 0)) arm_poll(c); } while (0)
@@ -280,10 +298,8 @@ void    arm_activate(const ArmModule* m);                // the one module of it
 ArmFunc arm_lookup(int cpu, uint32_t key);               // nullptr if not an entry
 bool    arm_is_landing(int cpu, uint32_t key);           // a landing of the active module
 uint32_t nds_crc32(const uint8_t* p, size_t n, uint32_t crc = 0);
-// Overlays: an address in an overlay's load area is looked up in the module of the
-// overlay resident there, found by its code's crc32 and checked again whenever
-// memory may have changed under it (the epoch: the cartridge bumps it with every
-// word it delivers) or a dispatched call's first instruction is not the module's.
-extern uint32_t g_arm_overlay_epoch;
-const ArmModule* arm_overlay_resident(int cpu, uint32_t addr);  // nullptr: none of the build's
-void    arm_overlay_changed(int cpu, uint32_t base, const ArmModule* now);  // services: a slot changed hands
+// Overlays: an address in an overlays' area is looked up among the overlay
+// modules with an entry there, the one whose function's bytes are in memory
+// as built (ArmModule::extents).
+void    arm_overlay_found(int cpu, const ArmModule* m);  // services: a function of m found in memory, after none or a miss
+void    arm_overlays_unknown();                          // memory written other than by stores: check them all again

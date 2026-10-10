@@ -270,10 +270,11 @@ class Body:
         return v
 
     def _base(self, ins):
-        """Rn as an operand (adr and Thumb literal loads: the aligned pc)."""
+        """Rn as an operand (adr and Thumb literal loads: the aligned pc; Thumb's
+        add of a high register, a switch's `add pc, rB`: pc + 4 as it is)."""
         if ins.rn == 15:
             if ins.thumb:
-                return _h((ins.pc + 4) & ~3)
+                return _h((ins.pc + 4) & ~3 if ins.imm is not None else ins.pc + 4)
             return _h(_pcv(ins, 4 if ins.rs is not None else 0))
         return _r(ins.rn)
 
@@ -815,6 +816,19 @@ class Body:
                     lines.append("    " + self._tail(succ | self.T))
         lines.append("}")        # (a fall-through goes forward: a late label is printed when reached)
         return lines
+
+
+def interpreted(entry, thumb, why):
+    """A function the emitter cannot translate (an instruction no compiler
+    writes: bytes that are not code as they lie, encrypted or data), as a
+    call into the runtime's interpreter, which runs whatever is there when it
+    is called."""
+    key = entry | int(thumb)
+    return ["// %s: interpreted (%s)" % (fname(entry, thumb), why),
+            "void %s(ArmContext& c) {" % fname(entry, thumb),
+            "    ARM_ENTER(c, %s);" % _h(key),
+            "    arm_interpret(c, %s);" % _h(key),
+            "}"]
 
 
 def _shift_imm(kind, n, m):

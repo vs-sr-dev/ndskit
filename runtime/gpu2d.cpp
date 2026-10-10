@@ -326,6 +326,14 @@ static inline void push(Line& L, int x, uint32_t px, int layer) {
     L.top[x] = px; L.toplayer[x] = (uint8_t)layer;
 }
 
+static uint32_t g_cap;                              // DISPCAPCNT as the frame began with it enabled; 0: none
+// The capture's source A is engine A's graphics (BGs, OBJs, 3D) whatever its display
+// shows: on a line shown otherwise (VRAM or main memory display), they are composed here.
+static uint32_t g_capline[192][256][2];
+static bool g_cap_own[192];                         // line y of the capture comes from g_capline
+
+static void layers(Line& L, int y, uint32_t* outw, uint32_t w1base);
+
 static void draw_line(int e, int y) {
     static Line L;
     L.e = e;
@@ -346,25 +354,39 @@ static void draw_line(int e, int y) {
     uint32_t dmode = (d >> 16) & (e ? 1 : 3);
     uint16_t pow = io_reg16(9, 0x04000304u);
     bool on = pow & (e ? 0x200 : 0x2);
-    if (!on || dmode == 0 || (d & 0x80)) {
-        // the engine off, the display off, or a forced blank: white
+    if (e == 0) g_cap_own[y] = false;
+    if (!on || (d & 0x80)) {
+        // the engine off or a forced blank: white
         for (int x = 0; x < 256; ++x) { outw[2 * x] = 0x3FFFF; outw[2 * x + 1] = w1base; }
         return;
     }
-    if (dmode == 2) {                               // VRAM display: a bank in the LCDC area, direct colour
+    if (dmode == 1) {
+        layers(L, y, outw, w1base);
+        return;
+    }
+    if (e == 0 && g_cap) {
+        layers(L, y, &g_capline[y][0][0], w1base);
+        g_cap_own[y] = true;
+    }
+    if (dmode == 0) {                               // the display off: white
+        for (int x = 0; x < 256; ++x) { outw[2 * x] = 0x3FFFF; outw[2 * x + 1] = w1base; }
+    } else if (dmode == 2) {                        // VRAM display: a bank in the LCDC area, direct colour
         uint32_t base = ((d >> 18) & 3) * 0x20000u + (uint32_t)y * 512;
         for (int x = 0; x < 256; ++x) {
             outw[2 * x] = c666(vram_r16(VRAM_LCDC, base + 2 * x));
             outw[2 * x + 1] = w1base;
         }
-        return;
-    }
-    if (dmode == 3) {
+    } else {
         nds_once("2d", 3, "2D: main memory display is not drawn");
         for (int x = 0; x < 256; ++x) { outw[2 * x] = 0; outw[2 * x + 1] = w1base; }
-        return;
     }
+}
 
+// An engine's graphics on line y: its BGs, OBJs (and engine A's 3D) through the
+// windows and the blending, two words a pixel into outw.
+static void layers(Line& L, int y, uint32_t* outw, uint32_t w1base) {
+    int e = L.e;
+    uint32_t d = L.dispcnt;
     sprites(L, y);
     windows(L, y);
     uint32_t backdrop = c666(pal16(L, 0));
@@ -451,7 +473,6 @@ static void draw_line(int e, int y) {
 }
 
 bool g_2d_on = true;
-static uint32_t g_cap;                              // DISPCAPCNT as the frame began with it enabled; 0: none
 
 void gpu2d_line(int y) {
     if (y == 0) {
@@ -466,7 +487,7 @@ void gpu2d_line(int y) {
 // ---- display capture --------------------------------------------------------------------------
 // The frame after DISPCAPCNT's enable bit is set (latched at its line 0) is captured at its end
 // into a VRAM bank (A-D, written directly whatever it is mapped to), from source A (engine A's
-// picture before the master brightness, or the 3D alone), source B (a VRAM bank, the one
+// graphics before the master brightness, whatever its display shows, or the 3D alone), source B (a VRAM bank, the one
 // DISPCNT's display block names, from the read offset) or the two blended by EVA and EVB;
 // 15-bit colour with the alpha bit, lines of the capture's width; then the enable bit clears.
 // The 3D comes from the renderer at the DS's resolution. Main memory display as source B is
@@ -508,7 +529,7 @@ void gpu2d_capture() {
                 if (only3d) {
                     a = c555(px) | ((px >> 18 & 31) ? 0x8000 : 0);
                 } else {
-                    const uint32_t* wd = g_2d.px[0][y][x];
+                    const uint32_t* wd = g_cap_own[y] ? g_capline[y][x] : g_2d.px[0][y][x];
                     uint32_t ww[2] = {wd[0], wd[1] & ~(3u << 24)};
                     uint32_t rgb = gpu2d_compose(ww, px);
                     a = (uint16_t)((rgb >> 19 & 31) | (rgb >> 11 & 31) << 5 | (rgb >> 3 & 31) << 10 | 0x8000);

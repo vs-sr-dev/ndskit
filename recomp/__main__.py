@@ -18,9 +18,11 @@ overlay, p_<name>_ov<id>: each overlay is discovered with the program, loaded
 at its address; the overlay's module holds its own functions and calls the
 program's directly, and the program's module holds every function of its
 own that some overlay's run found. Calls into an overlay's load area go
-through the runtime, which looks them up in the module of the overlay
-resident there (by its code's crc32: the module lists the code's ranges and
-each entry's first instruction). Writes, into --out:
+through the runtime, which looks them up among the overlays' modules: the
+function whose bytes are in memory as built runs (the module lists each
+function's extent, its code and literal pools, with its crc32); a function
+the emitter cannot take (bytes that are no code as they lie: encrypted) and
+code no module holds are left to the runtime's interpreter. Writes, into --out:
 
     p_<name>_funcs.h        prototypes and the module descriptor
     p_<name>_NNN.cpp        the functions, split by instruction count
@@ -99,6 +101,16 @@ def copy_segment(segs, dest, src, n):
     raise SystemExit("--copy: %08X-%08X is not inside one segment of the program" % (src, src + n))
 
 
+def loaded_segment(rom, cpu):
+    """A program stored compressed (it decompresses itself in its crt0), as the
+    cartridge loads it: what memory holds at the boot, where the runtime looks
+    for the program's module. None when the program is stored plain."""
+    code = rom.arm9 if cpu == 9 else rom.arm7
+    if code.data == code.plain:
+        return None
+    return discover.Segment(code.ram, code.data, "loaded")
+
+
 def volatile_literals(prog):
     """Literal-pool slots that some literal points at: data the code may
     write, so their loads read memory instead of folding the constant."""
@@ -131,8 +143,9 @@ class Module:
     names the program's module, whose entries it calls directly. `prog` may be
     given, already discovered."""
 
-    def __init__(self, name, segs, cpu, seeds, overlay=None, ext=None, prog=None):
+    def __init__(self, name, segs, cpu, seeds, overlay=None, ext=None, prog=None, loaded=None):
         self.name, self.segs, self.cpu = name, segs, cpu
+        self.loaded = loaded                 # the program as loaded, when it decompresses itself
         self.ns = "p_" + name.lower()
         self.overlay, self.ext = overlay, ext
         if prog is None:
@@ -155,20 +168,19 @@ class Module:
         self.files, self.sites, self.unknown = [], {}, []
         self.n_ins = 0
 
-    def code_ranges(self, gap=64):
-        """The overlay's code as address ranges: each function from its first to its
-        last instruction, merged across gaps under `gap` bytes (literal pools); the
-        data the overlay changes once loaded lies outside them."""
-        out = []
-        for e in sorted(self.own):
-            f = self.own[e]
-            lo, last = min(f.code), max(f.code)
-            hi = last + (2 if f.thumb else 4)
-            if out and lo - out[-1][1] < gap:
-                out[-1][1] = max(out[-1][1], hi)
-            else:
-                out.append([lo, hi])
-        return out
+    def extent(self, f, volatile):
+        """The bytes a function of an overlay is built from: its first instruction
+        to its last, and the literal pools it reads constants from (folded into
+        the code), within the overlay's segment."""
+        seg, mem = self.overlay[1], self.prog.mem
+        lo = min(f.code)
+        hi = max(f.code) + (2 if f.thumb else 4)
+        for a in f.code:
+            ins = mem.insn(a, f.thumb)
+            n = ins.literal_size
+            if n and ins.target not in volatile and seg.base <= ins.target and ins.target + n <= seg.end:
+                lo, hi = min(lo, ins.target), max(hi, ins.target + n)
+        return max(lo, seg.base), min(hi, seg.end)
 
     def generate(self, out, per_file, comments):
         prog = self.prog
@@ -190,10 +202,18 @@ class Module:
             self.files.append(name)
             buf, count, idx = [], 0, idx + 1
 
+        self.interpreted = []
         for e in sorted(self.own):
             fn = self.own[e]
             body = E.Body(prog, fn, self.entries, volatile, arch, comments, self.names)
-            buf.append("\n".join(body.emit()))
+            try:
+                lines = body.emit()
+            except E.Unsupported as why:     # bytes that are not code as they lie (encrypted, data)
+                self.interpreted.append((e, str(why)))
+                buf.append("\n".join(E.interpreted(fn.entry, fn.thumb, str(why))))
+                count += len(fn.code)
+                continue
+            buf.append("\n".join(lines))
             for k, v in body.sites.items():
                 self.sites[k] = self.sites.get(k, 0) + v
             self.unknown += [(t, e) for t in body.unknown]
@@ -213,7 +233,6 @@ class Module:
                 f.write("void %s(ArmContext& c);\n" % E.fname(k & ~1, k & 1))
             f.write("extern const ArmModule module;\n}  // namespace %s\n" % self.ns)
         segs = [self.overlay[1]] if self.overlay is not None else self.segs
-        mem = prog.mem
         with Out(os.path.join(out, self.ns + "_table.cpp")) as f:
             f.write('#include "%s_funcs.h"\n\nnamespace %s {\n\n' % (self.ns, self.ns))
             f.write("static const ArmSegment segs[] = {\n")
@@ -221,6 +240,10 @@ class Module:
                 kind = 2 if self.overlay is not None else 1 if s.name == "copy" else 0
                 f.write("    {0x%08Xu, 0x%Xu, 0x%08Xu, %d},  // %s\n" % (
                     s.base, len(s.data), zlib.crc32(s.data), kind, s.name))
+            if self.loaded is not None:
+                s = self.loaded
+                f.write("    {0x%08Xu, 0x%Xu, 0x%08Xu, 3},  // as loaded, compressed\n" % (
+                    s.base, len(s.data), zlib.crc32(s.data)))
             f.write("};\n\nstatic const ArmFuncEntry funcs[] = {\n")
             for k in keys:
                 f.write("    {0x%08Xu, %s},\n" % (k, E.fname(k & ~1, k & 1)))
@@ -229,23 +252,17 @@ class Module:
                            for r in rs})
             if land:
                 f.write("static const uint32_t landings[] = {%s};\n\n" % ", ".join("0x%08Xu" % t for t in land))
-            tail = "-1, nullptr, 0, 0, nullptr, nullptr, 0"
+            tail = "-1, nullptr, nullptr"
             if self.overlay is not None:
-                ranges = self.code_ranges()
-                crc, s = 0, self.overlay[1]
-                for lo, hi in ranges:
-                    crc = zlib.crc32(s.data[lo - s.base:hi - s.base], crc)
-                f.write("static const ArmRange code[] = {\n%s};\n\n" % "".join(
-                    "    {0x%08Xu, 0x%Xu},\n" % (lo, hi - lo) for lo, hi in ranges))
-                f.write("static const uint32_t firsts[] = {\n%s};\n\n" % "".join(
-                    "    0x%08Xu,\n" % (mem.u16(k & ~1) if k & 1 else mem.u32(k)) for k in keys))
-                words = [a for lo, hi in ranges for a in range((lo + 3) & ~3, hi - 3, 4)]
-                pick = [words[i * len(words) // 64] for i in range(min(64, len(words)))]
-                f.write("static const uint32_t samples[] = {\n%s};\n\n" % "".join(
-                    "    0x%08Xu, 0x%08Xu,\n" % (a, mem.u32(a)) for a in pick))
-                tail = "%d, code, %d, 0x%08Xu, firsts, samples, %d" % (self.overlay[0], len(ranges), crc, len(pick))
+                s = self.overlay[1]
+                ext = [self.extent(self.own[k & ~1], volatile) for k in keys]
+                f.write("static const ArmRange extents[] = {\n%s};\n\n" % "".join(
+                    "    {0x%08Xu, 0x%Xu},\n" % (lo, hi - lo) for lo, hi in ext))
+                f.write("static const uint32_t crcs[] = {\n%s};\n\n" % "".join(
+                    "    0x%08Xu,\n" % zlib.crc32(s.data[lo - s.base:hi - s.base]) for lo, hi in ext))
+                tail = "%d, extents, crcs" % self.overlay[0]
             f.write('extern const ArmModule module = {"%s", %d, segs, %d, funcs, %d, %s, %d, %s};\n'
-                    % (self.name, self.cpu, len(segs), len(keys), "landings" if land else "nullptr",
+                    % (self.name, self.cpu, len(segs) + (self.loaded is not None), len(keys), "landings" if land else "nullptr",
                        len(land), tail))
             f.write("\n}  // namespace %s\n" % self.ns)
         self.files.append(self.ns + "_table.cpp")
@@ -322,6 +339,8 @@ def generate(modules_spec, out, per_file=8000, comments=True, optest=False, log=
                 "arm_jump at run time:\n")
         f.write("\n".join(rows) + "\n" + tot + "\n\n")
         for m in modules:
+            for e, why in m.interpreted:
+                f.write("%s: %08X left to the interpreter (%s)\n" % (m.name, e, why))
             seen = set()
             for t, e in sorted(m.unknown):
                 if t not in seen:
@@ -431,7 +450,9 @@ def main(argv=None):
                     segs.append(copy_segment(segs, dest, src, n))
                     seeds.append(dest)
             overlays = [] if a.no_overlays else (rom.overlays9 if cpu == 9 else rom.overlays7)
-            specs += program_specs(rom, cpu, segs, seeds, overlays)
+            ps = program_specs(rom, cpu, segs, seeds, overlays)
+            ps[0] = ps[0][:4] + (dict(loaded=loaded_segment(rom, cpu)),)
+            specs += ps
     for spec in a.image:
         name, path, base, cpu, seeds = parse_image(spec)
         with open(path, "rb") as fh:

@@ -325,6 +325,13 @@ class Program:
             for a, b in ((ins.rn, ins.rm), (ins.rm, ins.rn)):
                 if a in regs and regs.get(("w", b)) == regs[a]:
                     sym = ("o", regs[a])
+        # "top": the word on top of the stack, when one register holding a known
+        # value was pushed alone; anything else that moves sp forgets it
+        if ins.op == "stm" and ins.rn == 13 and ins.writeback and ins.mode == "db" and ins.cond == 14 \
+                and ins.reglist and not ins.reglist & (ins.reglist - 1) and ins.reglist.bit_length() - 1 in regs:
+            regs["top"] = regs[ins.reglist.bit_length() - 1]
+        elif ins.rd == 13 or ins.rn == 13 and (ins.writeback or ins.op in ("ldm", "stm")):
+            regs.pop("top", None)
         # a conditional `add/sub rd, pc, #k`: rd is one of several code addresses
         # (`addhs r4, pc, #a; addlo r4, pc, #b; ...; bx r4`)
         alt = None
@@ -419,6 +426,7 @@ class Program:
                 if ins.rm == 15 and ins.op in ("bx", "blx"):
                     src = ins.pc + (4 if thumb else 8)      # bx pc: Thumb's veneer into ARM
                 lr_before = regs.get(14)
+                top_before = regs.get("top")
                 self._consts_step(regs, ins)
                 if ins.rd == 14 and not thumb and ins.cond == 14 and 14 in regs and (
                         ins.op == "mov" and ins.rm == 15 or ins.op in ("add", "sub") and ins.rn == 15):
@@ -478,6 +486,18 @@ class Program:
                     pc = nxt
                     continue
                 # everything else that writes pc
+                if top_before is not None and op == "ldm" and ins.rn == 13 and ins.writeback \
+                        and ins.reglist == 0x8000 and not ins.user and mem.arch >= 5 \
+                        and mem.inside(top_before & ~1):
+                    # a constant pushed, then popped into pc: a jump there (CodeWarrior's
+                    # Thumb thunks into ARM code: `ldr r2, =f; push {r2}; mov r2, r12; pop {pc}`)
+                    f.sites[pc] = ("jump", top_before, None)
+                    f.tails.add((top_before & ~1, bool(top_before & 1)))
+                    if go_on:
+                        ended, since = cond, []
+                        pc = nxt
+                        continue
+                    break
                 if op == "bx" and ins.rm == 14 or op == "mov" and ins.rm == 14 and ins.imm is None \
                         or op == "ldm" or op == "ldr" and ins.rn == 13 and ins.writeback \
                         or self._popped_return(ins):

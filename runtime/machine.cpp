@@ -381,16 +381,20 @@ void arm_bad_return(ArmContext& c, uint32_t expected) {
     nds_fatal("ARM%d returned to %08X, expected %08X", c.cpu, c.pc, expected);
 }
 
-void arm_overlay_changed(int cpu, uint32_t base, const ArmModule* now) {
-    nds_note("ARM%d: the overlay area %08X holds %s", cpu, base, now ? now->name : "none of this build's overlays");
+void arm_overlay_found(int cpu, const ArmModule* m) {
+    nds_note("ARM%d: %s found in memory (overlay %d at %08X)", cpu, m->name, m->overlay, m->segs[0].base);
 }
 
-// A call to code the modules do not have. If it is code the program copied
-// there from its own image, say where from: the recompiler takes it with --copy.
+// A call to code the modules do not have: interpreted. If it is code the
+// program copied there from its own image, say where from: the recompiler
+// takes it with --copy, and it runs recompiled.
 void arm_call_unknown(ArmContext& c, uint32_t key) {
     uint8_t here[32];
     uint32_t a = key & ~1u;
-    if (nds_mem_read(c.cpu, a, here, sizeof here)) {
+    if (!nds_mem_read(c.cpu, a, here, sizeof here))
+        nds_fatal("ARM%d: call to %08X, not an entry nor memory (lr %08X)", c.cpu, key, c.r[14]);
+    static std::set<uint32_t> told;
+    if (told.insert(key).second) {
         for (int m = 0; m < g_arm_nmodules; ++m) {
             const ArmModule* mod = g_arm_modules[m];
             if (mod->cpu != c.cpu) continue;
@@ -414,7 +418,12 @@ void arm_call_unknown(ArmContext& c, uint32_t key) {
             }
         }
     }
-    nds_fatal("ARM%d: call to %08X, not an entry (lr %08X)", c.cpu, key, c.r[14]);
+    arm_interpret(c, key);
+}
+
+void arm_interpreting(ArmContext& c, uint32_t key) {
+    nds_once("interpret", key | (uint32_t)(c.cpu == 7) << 31, "ARM%d: %08X interpreted (lr %08X): no module holds it",
+             c.cpu, key, c.r[14]);
 }
 
 // CP15 (the ARM9): the TCMs' places, the waits for an interrupt; the rest kept.
@@ -528,6 +537,7 @@ static void dump() {
     write_file(g_cfg.out + "/dtcm.bin", g_dtcm, 0x4000);
     write_file(g_cfg.out + "/wram7.bin", g_wram7, 0x10000);
     write_file(g_cfg.out + "/swram.bin", g_swram, 0x8000);
+    write_file(g_cfg.out + "/vram.bin", vram_bank(0), 0xA4000);     // banks A-I, in order
     std::vector<uint16_t> io(0x1000);
     for (uint32_t i = 0; i < 0x1000; ++i) io[i] = io_reg16(9, 0x04000000u + 2 * i);
     write_file(g_cfg.out + "/io9.bin", io.data(), 0x2000);
@@ -551,9 +561,14 @@ static const ArmModule* find_module(int cpu) {
     for (int i = 0; i < g_arm_nmodules; ++i) {
         const ArmModule* m = g_arm_modules[i];
         if (m->cpu != cpu || !m->nsegs || m->overlay >= 0) continue;
-        const ArmSegment& s = m->segs[0];          // the block at its load address: the autoloads are not in place yet
-        std::vector<uint8_t> buf(s.size);
-        if (nds_mem_read(cpu, s.base, buf.data(), s.size) && nds_crc32(buf.data(), s.size) == s.crc) return m;
+        // the block at its load address (the autoloads are not in place yet), or
+        // the whole program as loaded when it is stored compressed
+        for (uint32_t k = 0; k < m->nsegs; ++k) {
+            const ArmSegment& s = m->segs[k];
+            if (k > 0 && s.kind != ARM_SEG_LOADED) continue;
+            std::vector<uint8_t> buf(s.size);
+            if (nds_mem_read(cpu, s.base, buf.data(), s.size) && nds_crc32(buf.data(), s.size) == s.crc) return m;
+        }
     }
     return nullptr;
 }

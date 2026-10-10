@@ -98,6 +98,17 @@ def run(mem, cpu, key, st, cp15, max_steps):
     c.cp15 = cp15
     c.set_cpsr(st[15], 0xF)
     c.r[:15] = list(st[:15])
+    known = getattr(mem, "known", None)
+    if known:
+        # only the code discovery found: a pc popped from a random stack can run
+        # on through other code and come back to the sentinel by chance
+        step = c.step
+
+        def checked():
+            if c.pc not in known:
+                raise armemu.MemoryFault("%08X: not discovered code" % c.pc)
+            step()
+        c.step = checked
     c.call(key, max_steps=max_steps)
     return c.r[:15] + [c.cpsr]
 
@@ -159,6 +170,7 @@ def pure_functions(cpu, images, prog, rng, trials=6, max_steps=20_000):
         for mode in ("game", "args"):
             mem = new_memory(cpu, images)
             mem.code = code
+            mem.known = prog.code
             mem.log = []
             ok = True
             for _ in range(trials):
@@ -655,6 +667,31 @@ def _control(a, func, arch):
         a.label("OC%d" % i)
         a.dp("add", 1, 1, imm=1 << i)
         a.bx(14)
+    # CodeWarrior's Thumb switch: a table of halfword offsets from `add pc, r0`'s
+    # pc + 4, which is not word-aligned when the add is at an address 2 mod 4
+    for pad in (0, 1):
+        p = "TSW%d_" % pad
+        func("thumb switch, add pc at %d mod 4" % (2 - 2 * pad), small=[0], thumb=True)
+        if pad:
+            a.half(0x46C0)                   # nop (mov r8, r8)
+        a.half(0x2803)                       # cmp r0, #3
+        a.t_b(p + "D", cond=8)               # bhi default
+        a.half(0x1800)                       # adds r0, r0, r0
+        a.half(0x4478)                       # add r0, pc
+        a.half(0x88C0)                       # ldrh r0, [r0, #6]
+        a.half(0x0400)                       # lsls r0, r0, #16
+        a.half(0x1400)                       # asrs r0, r0, #16
+        a.label(p + "P")
+        a.half(0x4487)                       # add pc, r0
+        for i in range(4):
+            a.half(lambda L, pc, i=i, p=p: L[p + str(i)] - L[p + "P"] - 4)
+        for i in range(4):
+            a.label(p + str(i))
+            a.t_movi(2, 10 + i)
+            a.t_bx(14)
+        a.label(p + "D")
+        a.t_movi(2, 99)
+        a.t_bx(14)
     # interworking
     a.align(4)
     func("thumb subroutine", thumb=True)
@@ -828,6 +865,19 @@ def main(argv=None):
         oseg = segs[-1]
         tested = copy.copy(prog)
         tested.funcs = {e: f for e, f in prog.funcs.items() if oseg.base <= e < oseg.end}
+    # a segment outside the memory the test models (an ARM7 autoload linked for
+    # VRAM, which runs only once the ARM9 gives the ARM7 its banks) is left out,
+    # with its functions
+    ref = armemu.ds_memory(a.cpu)
+    out_segs = [s for s in segs if any(ref.find(x, 1)[0] is None
+                                       for x in list(range(s.base, s.end, 0x100)) + [s.end - 1])]
+    for s in out_segs:
+        print("%08X-%08X (%s): outside the test's memory, its functions not tested"
+              % (s.base, s.end, s.name))
+    segs = [s for s in segs if s not in out_segs]
+    if out_segs:
+        tested = copy.copy(tested)
+        tested.funcs = {e: f for e, f in tested.funcs.items() if not any(s.base <= e < s.end for s in out_segs)}
     out_dir = os.path.dirname(os.path.abspath(a.out))
     images = [(s.data, s.base) for s in segs]
     data = scratch_data(a.seed)
@@ -856,6 +906,7 @@ def main(argv=None):
             funcs.setdefault(k, mode)
     mem = new_memory(a.cpu, images)
     mem.code = code_ranges(prog)
+    mem.known = prog.code
     total = 0
     cp15 = {}
     for key, mode in funcs.items():

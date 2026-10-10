@@ -10,7 +10,7 @@
 // --mute). Otherwise headless: it runs until N VBlanks have passed (or a
 // fatal error), writes both screens as PNGs at the VBlanks asked for
 // (DIR/v<N>.png), then writes the memories to DIR (main.bin, itcm.bin,
-// dtcm.bin, wram7.bin, swram.bin) and the CPUs' registers (cpus.txt), for
+// dtcm.bin, wram7.bin, swram.bin, vram.bin: the banks A-I in order) and the CPUs' registers (cpus.txt), for
 // comparisons with an oracle. Either way --wav writes the sound to a file.
 #include "display.h"
 #include "nds.h"

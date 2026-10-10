@@ -27,8 +27,10 @@ static uint8_t* host(int cpu, uint32_t a) {
 bool nds_mem_write(int cpu, uint32_t addr, const void* src, size_t n) {
     const uint8_t* s = (const uint8_t*)src;
     for (size_t i = 0; i < n; ++i) {
-        uint8_t* p = host(cpu, addr + (uint32_t)i);
+        uint32_t a = addr + (uint32_t)i;
+        uint8_t* p = host(cpu, a);
         if (!p) return false;
+        cpu == 9 ? nds_ovl_store<9>(a) : nds_ovl_store<7>(a);
         *p = s[i];
     }
     return true;
@@ -128,6 +130,7 @@ bool arm_identify(const ArmModule* m) {
     for (uint32_t s = 0; s < m->nsegs; ++s) {
         const ArmSegment& g = m->segs[s];
         if (g.kind != ARM_SEG_PROGRAM) continue;   // not there until the program copies or loads it
+        if (!host(m->cpu, g.base)) continue;       // not memory the core holds (VRAM): not checked
         std::vector<uint8_t> buf(g.size);          // a segment may span two memories (the ARM7's WRAMs)
         if (!nds_mem_read(m->cpu, g.base, buf.data(), g.size)) return false;
         if (nds_crc32(buf.data(), g.size) != g.crc) return false;
@@ -149,118 +152,140 @@ static int find_func(const ArmModule* m, uint32_t key) {
 }
 
 // ---- overlays ---------------------------------------------------------------------------
-uint32_t g_arm_overlay_epoch = 1;
+// Each CPU's overlays' area (from the lowest load address to the highest end)
+// in pages of 256 bytes. Every overlay function of the build is listed by key
+// with its state: unknown (to check), its bytes in memory as built, or not. A
+// store into a page (nds_ovl_store) makes the functions over it unknown again;
+// a function is checked (the crc32 of its extent) when a call reaches it.
+uint32_t g_ovl_lo[2], g_ovl_len[2];
+uint8_t* g_ovl_dirty[2];
+uint8_t g_ovl_any[2];
 
 namespace {
-struct Slot {                                    // one load address and the overlays that share it
-    int cpu;
-    uint32_t base, end;                          // the largest of them
-    std::vector<const ArmModule*> cands;
-    const ArmModule* resident = nullptr;
-    uint32_t epoch = 0;                          // when resident was last checked
+enum : uint8_t { UNKNOWN, THERE, GONE };
+struct OvFn { uint32_t key; const ArmModule* m; uint32_t i; };
+struct Area {
+    uint32_t lo = 0, hi = 0;
+    std::vector<OvFn> fns;                       // sorted by key
+    std::vector<uint8_t> state;                  // of each of fns
+    std::vector<std::vector<uint32_t>> on_page;  // the fns whose extent meets each page
+    std::vector<uint8_t> dirty;
+    std::vector<const ArmModule*> found;         // modules with a function found since their last miss
 };
-std::vector<Slot> g_slots;
-bool g_slots_made;
+Area g_area[2];
+bool g_areas_made;
 
-void make_slots() {
-    g_slots_made = true;
-    for (int i = 0; i < g_arm_nmodules; ++i) {
-        const ArmModule* m = g_arm_modules[i];
-        if (m->overlay < 0 || !m->nsegs) continue;
-        const ArmSegment& s = m->segs[0];
-        Slot* t = nullptr;
-        for (Slot& x : g_slots)
-            if (x.cpu == m->cpu && x.base == s.base) t = &x;
-        if (!t) { g_slots.push_back(Slot{m->cpu, s.base, s.base}); t = &g_slots.back(); }
-        t->end = std::max(t->end, s.base + s.size);
-        t->cands.push_back(m);
+void make_areas() {
+    g_areas_made = true;
+    for (int ci = 0; ci < 2; ++ci) {
+        Area& A = g_area[ci];
+        int cpu = ci ? 7 : 9;
+        bool any = false;
+        for (int k = 0; k < g_arm_nmodules; ++k) {
+            const ArmModule* m = g_arm_modules[k];
+            if (m->cpu != cpu || m->overlay < 0 || !m->nsegs) continue;
+            const ArmSegment& s = m->segs[0];
+            if (!any || s.base < A.lo) A.lo = s.base;
+            if (!any || s.base + s.size > A.hi) A.hi = s.base + s.size;
+            any = true;
+            for (uint32_t i = 0; i < m->nfuncs; ++i) A.fns.push_back({m->funcs[i].key, m, i});
+        }
+        if (!any) continue;
+        A.lo &= ~0xFFu;
+        std::stable_sort(A.fns.begin(), A.fns.end(), [](const OvFn& a, const OvFn& b) { return a.key < b.key; });
+        A.state.assign(A.fns.size(), UNKNOWN);
+        uint32_t pages = (A.hi - A.lo + 255) >> 8;
+        A.on_page.resize(pages);
+        A.dirty.assign(pages, 0);
+        for (uint32_t j = 0; j < A.fns.size(); ++j) {
+            const ArmRange& e = A.fns[j].m->extents[A.fns[j].i];
+            if (!e.size) continue;
+            for (uint32_t p = (e.base - A.lo) >> 8; p <= (e.base + e.size - 1 - A.lo) >> 8 && p < pages; ++p)
+                A.on_page[p].push_back(j);
+        }
+        g_ovl_dirty[ci] = A.dirty.data();
+        g_ovl_lo[ci] = A.lo;
+        g_ovl_len[ci] = pages << 8;
     }
 }
 
-bool code_matches(const ArmModule* m) {
+void forget_written(int ci) {
+    Area& A = g_area[ci];
+    g_ovl_any[ci] = 0;
+    for (size_t p = 0; p < A.dirty.size(); ++p)
+        if (A.dirty[p]) {
+            A.dirty[p] = 0;
+            for (uint32_t j : A.on_page[p]) A.state[j] = UNKNOWN;
+        }
+}
+
+bool bytes_there(int cpu, const ArmModule* m, uint32_t i) {
+    const ArmRange& e = m->extents[i];
+    uint8_t buf[4096];
     uint32_t crc = 0;
-    std::vector<uint8_t> buf;
-    for (uint32_t i = 0; i < m->ncode; ++i) {
-        buf.resize(m->code[i].size);
-        if (!nds_mem_read(m->cpu, m->code[i].base, buf.data(), buf.size())) return false;
-        crc = nds_crc32(buf.data(), buf.size(), crc);
+    for (uint32_t o = 0; o < e.size; o += sizeof buf) {
+        uint32_t n = std::min<uint32_t>(sizeof buf, e.size - o);
+        if (!nds_mem_read(cpu, e.base + o, buf, n)) return false;
+        crc = nds_crc32(buf, n, crc);
     }
-    return crc == m->code_crc;
+    return crc == m->crcs[i];
 }
 
-bool samples_match(const ArmModule* m) {
-    for (uint32_t i = 0; i < m->nsamples; ++i) {
-        uint32_t w = 0;
-        if (!nds_mem_read(m->cpu, m->samples[2 * i], &w, 4) || w != m->samples[2 * i + 1]) return false;
+// The overlay function at key whose bytes are in memory, or -1 (an index of fns).
+int overlay_fn(int cpu, uint32_t key) {
+    if (!g_areas_made) make_areas();
+    int ci = cpu == 9 ? 0 : 1;
+    Area& A = g_area[ci];
+    if ((key & ~1u) - A.lo >= A.hi - A.lo) return -1;
+    if (g_ovl_any[ci]) forget_written(ci);
+    auto it = std::lower_bound(A.fns.begin(), A.fns.end(), key, [](const OvFn& f, uint32_t k) { return f.key < k; });
+    for (; it != A.fns.end() && it->key == key; ++it) {
+        uint32_t j = (uint32_t)(it - A.fns.begin());
+        if (A.state[j] == UNKNOWN) {
+            bool there = bytes_there(cpu, it->m, it->i);
+            A.state[j] = there ? THERE : GONE;
+            auto f = std::find(A.found.begin(), A.found.end(), it->m);
+            if (there && f == A.found.end()) {
+                A.found.push_back(it->m);
+                arm_overlay_found(cpu, it->m);
+            } else if (!there && f != A.found.end()) {
+                A.found.erase(f);
+            }
+        }
+        if (A.state[j] == THERE) return (int)j;
     }
-    return true;
-}
-
-// Which overlay the slot holds. `cheap`: memory may have changed (the cartridge
-// delivered data) and the one resident is checked by its samples first; a full
-// check (every candidate's code crc32) when it is not there, or none was.
-void check_slot(Slot& s, bool cheap = false) {
-    const ArmModule* was = s.resident;
-    const ArmModule* now = nullptr;
-    if (was && cheap && samples_match(was)) {
-        s.epoch = g_arm_overlay_epoch;
-        return;
-    }
-    if (was && code_matches(was)) now = was;     // most often still there
-    for (size_t i = 0; !now && i < s.cands.size(); ++i)
-        if (s.cands[i] != was && code_matches(s.cands[i])) now = s.cands[i];
-    s.resident = now;
-    s.epoch = g_arm_overlay_epoch;
-    if (now != was) arm_overlay_changed(s.cpu, s.base, now);
-}
-
-Slot* slot_of(int cpu, uint32_t a) {
-    if (!g_slots_made) make_slots();
-    for (Slot& s : g_slots)
-        if (s.cpu == cpu && a - s.base < s.end - s.base) return &s;
-    return nullptr;
-}
-
-uint32_t first_insn(int cpu, uint32_t key) {
-    uint32_t w = 0;
-    nds_mem_read(cpu, key & ~1u, &w, key & 1 ? 2 : 4);
-    return w;
+    return -1;
 }
 }  // namespace
-
-const ArmModule* arm_overlay_resident(int cpu, uint32_t addr) {
-    Slot* s = slot_of(cpu, addr);
-    if (!s) return nullptr;
-    if (s->epoch != g_arm_overlay_epoch) check_slot(*s, true);
-    return s->resident;
-}
 
 ArmFunc arm_lookup(int cpu, uint32_t key) {
     const ArmModule* m = g_active[cpu == 9 ? 0 : 1];
     if (!m) return nullptr;
     int i = find_func(m, key);
     if (i >= 0) return m->funcs[i].fn;
-    Slot* s = slot_of(cpu, key & ~1u);
-    if (!s) return nullptr;
-    if (s->epoch != g_arm_overlay_epoch) check_slot(*s, true);
-    for (int pass = 0; pass < 2 && s->resident; ++pass) {
-        const ArmModule* o = s->resident;
-        i = find_func(o, key);
-        if (i >= 0 && first_insn(cpu, key) == o->firsts[i]) return o->funcs[i].fn;
-        if (pass) break;
-        check_slot(*s);                          // not this overlay's entry or bytes: which one is there?
-        if (s->resident == o) break;
-    }
-    return nullptr;
+    int j = overlay_fn(cpu, key);
+    if (j < 0) return nullptr;
+    const OvFn& f = g_area[cpu == 9 ? 0 : 1].fns[j];
+    return f.m->funcs[f.i].fn;
 }
 
-bool arm_is_landing(int cpu, uint32_t key) {
-    const ArmModule* m = arm_overlay_resident(cpu, key & ~1u);    // a landing in an overlay
-    if (!m) m = g_active[cpu == 9 ? 0 : 1];
+void arm_overlays_unknown() {
+    for (Area& A : g_area) std::fill(A.state.begin(), A.state.end(), UNKNOWN);
+}
+
+static bool has_landing(const ArmModule* m, uint32_t key) {
     if (!m || !m->nlandings) return false;
     const uint32_t* e = m->landings + m->nlandings;
     const uint32_t* p = std::lower_bound(m->landings, e, key);
     return p != e && *p == key;
+}
+
+bool arm_is_landing(int cpu, uint32_t key) {
+    if (has_landing(g_active[cpu == 9 ? 0 : 1], key)) return true;
+    if (!g_areas_made) make_areas();
+    for (const ArmModule* m : g_area[cpu == 9 ? 0 : 1].found)     // a landing in an overlay found in memory
+        if ((key & ~1u) - m->segs[0].base < m->segs[0].size && has_landing(m, key)) return true;
+    return false;
 }
 
 void arm_call(ArmContext& c, uint32_t key) {
