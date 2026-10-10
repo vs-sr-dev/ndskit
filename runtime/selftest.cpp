@@ -99,6 +99,7 @@ int main(int argc, char** argv) {
                     std::fprintf(stderr, "cannot load %s at %s\n", path.c_str(), base.c_str());
                     return 2;
                 }
+                ++g_arm_overlay_epoch;      // another overlay may now be where the last file's was
             } else if (kw == "module") {
                 std::string name;
                 ss >> name;
